@@ -1,17 +1,48 @@
-use rsclip_core::format::{format_full_time, human_size};
-use rsclip_core::models::{ClipboardEntry, SecretEntry};
 use gtk::prelude::*;
 use gtk4 as gtk;
+use rsclip_core::files::{URI_LIST_PREVIEW_MAX_FILES, parse_uri_list_bounded};
+use rsclip_core::format::{format_full_time, human_size};
+use rsclip_core::models::{ClipboardEntry, EntryData, SecretEntry};
 
 use crate::components::labels::muted_label;
+use crate::components::preview::MAX_FULL_PREVIEW_BYTES;
 
 pub(crate) fn render_details(container: &gtk::Box, entry: &ClipboardEntry) {
-    let rows = [
-        ("Type", entry.kind.to_string()),
+    let mut rows = vec![("Type", entry.kind.to_string())];
+    if let EntryData::File { .. } = &entry.data {
+        // Same pre-parse bounds as the file preview: counts cover the shown
+        // subset, with "+" marking partial results.
+        let payload = entry.text_content.as_deref().unwrap_or("");
+        let bounded =
+            parse_uri_list_bounded(payload, URI_LIST_PREVIEW_MAX_FILES, MAX_FULL_PREVIEW_BYTES);
+        let shown = bounded.files.len();
+        rows.push((
+            "Files",
+            if bounded.truncated {
+                format!("{shown}+")
+            } else {
+                shown.to_string()
+            },
+        ));
+        let missing = bounded
+            .files
+            .iter()
+            .filter(|file| !file.path.exists())
+            .count();
+        rows.push((
+            "Missing",
+            if bounded.truncated {
+                format!("{missing}+")
+            } else {
+                missing.to_string()
+            },
+        ));
+    }
+    rows.extend([
         ("MIME", entry.mime_type.clone()),
         ("Size", human_size(entry.size_bytes)),
         ("First copied", format_full_time(entry.copied_at)),
-    ];
+    ]);
     render_rows(container, &rows);
 }
 

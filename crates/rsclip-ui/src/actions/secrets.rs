@@ -1,18 +1,17 @@
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use rsclip_core::Database;
-use rsclip_core::secrets::{default_secret_alias, secret_value_from_entry};
 use gtk::prelude::*;
 use gtk4 as gtk;
+use rsclip_core::secrets::{default_secret_alias, secret_value_from_entry};
 
 use crate::actions::refresh::refresh_entries;
 use crate::actions::{set_footer, update_mode_controls};
 use crate::dialogs::secret_alias::prompt_secret_alias;
-use crate::state::{AppState, AppView, current_entry, current_secret};
+use crate::state::{AppState, AppView, current_entry, current_full_entry, current_secret};
 
 pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::Window) {
-    let Some(entry) = current_entry(state) else {
+    let Some(entry) = current_full_entry(state) else {
         set_footer(state, "No selected entry to save");
         return;
     };
@@ -28,15 +27,16 @@ pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::
         "Save Secret",
         &default_alias,
         move |state, alias| {
-            let db = Database::open(&state.db_path)?;
-            db.save_secret(Some(entry.id), &alias, &value)?;
-            db.delete_entry(entry.id)?;
+            state.db.transaction(|db| {
+                db.save_secret(Some(entry.id), &alias, &value)?;
+                db.delete_entry(entry.id)?;
+                Ok(())
+            })?;
             *state.view.borrow_mut() = AppView::Secrets;
             *state.query.borrow_mut() = String::new();
             state.search_entry.set_text("");
-            state
-                .search_entry
-                .set_placeholder_text(Some("Search secrets by name..."));
+            let placeholder = crate::window::search_placeholder(state.as_ref(), AppView::Secrets);
+            state.search_entry.set_placeholder_text(Some(&placeholder));
             update_mode_controls(state);
             refresh_entries(state)?;
             set_footer(state, "Saved secret");
@@ -57,8 +57,7 @@ pub(crate) fn rename_current_secret_dialog(state: &Rc<AppState>, parent: &gtk::W
         "Rename Secret",
         &secret.alias,
         move |state, alias| {
-            let db = Database::open(&state.db_path)?;
-            db.rename_secret(secret.id, &alias)?;
+            state.db.rename_secret(secret.id, &alias)?;
             refresh_entries(state)?;
             set_footer(state, "Renamed secret");
             Ok(())
@@ -68,30 +67,28 @@ pub(crate) fn rename_current_secret_dialog(state: &Rc<AppState>, parent: &gtk::W
 
 pub(crate) fn toggle_pin(state: &Rc<AppState>) -> Result<()> {
     let entry = current_entry(state).context("no selected entry")?;
-    let db = Database::open(&state.db_path)?;
-    db.set_pinned(entry.id, !entry.pinned)?;
+    state.db.set_pinned(entry.id, !entry.pinned)?;
     refresh_entries(state)
 }
 
 pub(crate) fn delete_current(state: &Rc<AppState>) -> Result<()> {
-    let db = Database::open(&state.db_path)?;
     let view = *state.view.borrow();
     match view {
         AppView::Clipboard => {
             let entry = current_entry(state).context("no selected entry")?;
-            db.delete_entry(entry.id)?;
+            state.db.delete_entry(entry.id)?;
         }
         AppView::Secrets => {
             let secret = current_secret(state).context("no selected secret")?;
             let restore_clipboard = secret.source_entry_id.is_some();
-            db.delete_secret(secret.id)?;
+            state.db.delete_secret(secret.id)?;
             if restore_clipboard {
                 *state.view.borrow_mut() = AppView::Clipboard;
                 *state.query.borrow_mut() = String::new();
                 state.search_entry.set_text("");
-                state
-                    .search_entry
-                    .set_placeholder_text(Some("Search clipboard..."));
+                let placeholder =
+                    crate::window::search_placeholder(state.as_ref(), AppView::Clipboard);
+                state.search_entry.set_placeholder_text(Some(&placeholder));
                 update_mode_controls(state);
             }
         }

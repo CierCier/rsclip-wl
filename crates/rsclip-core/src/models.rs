@@ -131,7 +131,6 @@ pub struct ClipboardEntry {
     pub preview_text: Option<String>,
     pub text_content: Option<String>,
     pub pinned: bool,
-    pub favorite: bool,
     pub copied_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
@@ -152,7 +151,6 @@ impl ClipboardEntry {
             preview_text: None,
             text_content: None,
             pinned: false,
-            favorite: false,
             copied_at: 0,
             updated_at: 0,
             last_used_at: None,
@@ -173,7 +171,6 @@ impl ClipboardEntry {
             preview_text: None,
             text_content: None,
             pinned: false,
-            favorite: false,
             copied_at: 0,
             updated_at: 0,
             last_used_at: None,
@@ -198,7 +195,6 @@ impl ClipboardEntry {
             preview_text: None,
             text_content: None,
             pinned: false,
-            favorite: false,
             copied_at: 0,
             updated_at: 0,
             last_used_at: None,
@@ -223,7 +219,6 @@ impl ClipboardEntry {
             preview_text: None,
             text_content: None,
             pinned: false,
-            favorite: false,
             copied_at: 0,
             updated_at: 0,
             last_used_at: None,
@@ -233,6 +228,26 @@ impl ClipboardEntry {
                 value: value.to_string(),
                 format: format.to_string(),
             },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_file(id: i64, title: &str, uri_list: Option<&str>) -> Self {
+        Self {
+            id,
+            content_hash: "hash".to_string(),
+            kind: EntryKind::File,
+            mime_type: "text/uri-list".to_string(),
+            title: title.to_string(),
+            preview_text: None,
+            text_content: uri_list.map(str::to_string),
+            pinned: false,
+            copied_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+            use_count: 0,
+            size_bytes: uri_list.map(str::len).unwrap_or_default() as i64,
+            data: EntryData::File { source_app: None },
         }
     }
 }
@@ -279,6 +294,7 @@ pub enum EntryFilter {
     All,
     Text,
     Images,
+    Files,
     Links,
     Colors,
     Pinned,
@@ -289,11 +305,23 @@ impl EntryFilter {
         match value {
             "text" => Self::Text,
             "images" | "image" => Self::Images,
+            "files" | "file" => Self::Files,
             "links" | "link" => Self::Links,
             "colors" | "color" => Self::Colors,
             "pinned" => Self::Pinned,
             _ => Self::All,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntryFilter;
+
+    #[test]
+    fn parses_file_filter_aliases() {
+        assert_eq!(EntryFilter::parse("files"), EntryFilter::Files);
+        assert_eq!(EntryFilter::parse("file"), EntryFilter::Files);
     }
 }
 
@@ -309,7 +337,7 @@ pub enum SortMode {
 impl SortMode {
     pub fn parse(value: &str) -> Self {
         match value {
-            "recent" => Self::Recent,
+            "recent" | "newest" => Self::Recent,
             "oldest" => Self::Oldest,
             "type" => Self::Type,
             "most-used" => Self::MostUsed,

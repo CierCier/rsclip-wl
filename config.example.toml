@@ -1,5 +1,8 @@
 [history]
 max_entries = 2000
+# Set either value to 0 for unlimited payloads, for example:
+# max_text_bytes = 0
+# max_image_bytes = 0
 max_text_bytes = 1048576
 max_image_bytes = 10485760
 dedupe = true
@@ -7,13 +10,14 @@ cleanup_unpinned_after_days = 0
 
 [paste]
 auto_paste = true
-paste_delay_ms = 80
+paste_delay_ms = 140
 method = "wtype"
 
 [ocr]
 enabled = true
 command = "tesseract"
 default_language = "eng"
+# 0 disables the timeout.
 timeout_seconds = 20
 auto_index = false
 
@@ -21,10 +25,52 @@ auto_index = false
 theme = "nonchalant-dark"
 window_width = 920
 window_height = 620
+background_opacity = 0.70
+resizable = false
 preview_default = true
-image_preview_max_width = 520
-image_preview_max_height = 420
+sidebar_width = 320
+show_footer_hints = true
+reset_on_show = true
+auto_focus_search = true
+start_view = "clipboard"
+# Valid filters: all, text, images, files, links, colors, pinned.
+default_filter = "all"
+default_sort = "default"
+search_placeholder = "Search clipboard..."
+secrets_search_placeholder = "Search secrets by name..."
+
+# All ui.colors keys are optional. Missing keys use the built-in defaults.
+# The resident UI watches config.toml and hot-reloads UI settings and colors.
+[ui.colors]
+shell_bg = "rgba(30, 30, 32, 0.70)"
+shell_border = "rgba(220, 217, 231, 0.14)"
+surface = "#2a2a2c"
+surface_subtle = "rgba(42, 42, 44, 0.54)"
+surface_overlay = "#1e1e20"
+preview_bg = "rgba(30, 30, 32, 0.40)"
+preview_text_bg = "rgba(12, 12, 14, 0.34)"
+scrim_bg = "rgba(12, 12, 14, 0.42)"
+
+text = "#dcd9e7"
+text_strong = "#f0eafd"
+text_muted = "#9c96ad"
+text_selected_muted = "#c8bed6"
+
+border = "#4a4653"
+border_subtle = "rgba(220, 217, 231, 0.08)"
+border_preview = "rgba(220, 217, 231, 0.10)"
+border_dialog = "#5c516b"
+
+hover_bg = "#3b304a"
+selected_bg = "#453657"
+
+accent = "#c3fb5b"
+accent_hover = "#d4ff76"
+accent_text = "#11130f"
+
+destructive = "#6f2d38"
+destructive_border = "#9a4350"
+destructive_text = "#fff1f3"
 
 [links]
 favicon_cache = false
-

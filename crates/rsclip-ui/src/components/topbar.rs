@@ -10,7 +10,7 @@ pub(crate) struct Topbar {
     pub(crate) count: gtk::Label,
 }
 
-pub(crate) fn build() -> Topbar {
+pub(crate) fn build(search_placeholder: &str) -> Topbar {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     container.add_css_class("topbar");
 
@@ -24,13 +24,14 @@ pub(crate) fn build() -> Topbar {
     container.append(&secrets_button);
 
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search clipboard..."));
+    search.set_placeholder_text(Some(search_placeholder));
     search.add_css_class("search-box");
     search.set_hexpand(true);
     container.append(&search);
 
-    let filter =
-        gtk::DropDown::from_strings(&["All", "Text", "Images", "Links", "Colors", "Pinned"]);
+    let filter = gtk::DropDown::from_strings(&[
+        "All", "Text", "Images", "Files", "Links", "Colors", "Pinned",
+    ]);
     filter.add_css_class("filter-select");
     filter.set_selected(0);
     container.append(&filter);

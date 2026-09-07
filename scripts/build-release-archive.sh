@@ -38,6 +38,8 @@ install -Dm644 "${ROOT_DIR}/packaging/desktop/rsclip.desktop" \
   "${STAGE_DIR}/usr/share/applications/rsclip.desktop"
 install -Dm644 "${ROOT_DIR}/packaging/systemd/rsclipd.service" \
   "${STAGE_DIR}/usr/lib/systemd/user/rsclipd.service"
+install -Dm644 "${ROOT_DIR}/packaging/systemd/rsclip-ui.service" \
+  "${STAGE_DIR}/usr/lib/systemd/user/rsclip-ui.service"
 install -Dm644 "${ROOT_DIR}/config.example.toml" \
   "${STAGE_DIR}/usr/share/doc/rsclip/config.example.toml"
 install -Dm644 "${ROOT_DIR}/README.md" \
@@ -46,7 +48,10 @@ install -Dm644 "${ROOT_DIR}/LICENSE" \
   "${STAGE_DIR}/usr/share/licenses/rsclip/LICENSE"
 
 tar --zstd -cf "${ARCHIVE_PATH}" -C "${DIST_DIR}" "${ARCHIVE_STEM}"
-sha256sum "${ARCHIVE_PATH}" > "${ARCHIVE_PATH}.sha256"
+(
+  cd "${DIST_DIR}"
+  sha256sum "${ARCHIVE_STEM}.tar.zst" > "${ARCHIVE_STEM}.tar.zst.sha256"
+)
 
 printf 'Built %s\n' "${ARCHIVE_PATH}"
 printf 'Wrote %s.sha256\n' "${ARCHIVE_PATH}"
