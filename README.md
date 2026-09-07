@@ -26,6 +26,21 @@ On Arch/CachyOS, the GTK4 layer-shell system dependency is required for the over
 sudo pacman -S gtk4-layer-shell
 ```
 
+## Nix
+
+The flake supports `x86_64-linux` and `aarch64-linux` and provides a packaged build,
+development shell, checks, runnable apps, and a NixOS module:
+
+```bash
+nix develop
+nix build
+nix run .
+nix flake check
+```
+
+On NixOS, import the flake’s `nixosModules.default` and enable `programs.rsclip` to
+install the package and start the clipboard daemon with the graphical user session.
+
 Runtime tools expected by the full flow:
 
 ```bash
