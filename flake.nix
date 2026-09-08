@@ -247,6 +247,10 @@
               description = "rsclip clipboard daemon";
               after = [ "graphical-session.target" ];
               wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              unitConfig = {
+                ConditionEnvironment = "WAYLAND_DISPLAY";
+              };
               serviceConfig = {
                 Type = "simple";
                 ExecStart = "${cfg.package}/bin/rsclipd watch";
