@@ -48,6 +48,8 @@ const RSCLIP_DARK_SCHEME_XML: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
   <style name="def:function" foreground="blue_2"/>
   <style name="def:type" foreground="teal_2" bold="true"/>
   <style name="def:statement" foreground="orange_2" bold="true"/>
+  <style name="def:keyword" foreground="orange_2" bold="true"/>
+  <style name="def:operator" foreground="orange_2"/>
   <style name="def:preprocessor" foreground="orange_4"/>
   <style name="def:boolean" foreground="violet_2"/>
   <style name="def:heading" foreground="teal_3" bold="true"/>

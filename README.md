@@ -298,14 +298,6 @@ rsclipd favicons clear      # clear cached icons and failed-domain records
 rsclipd favicons refresh    # re-queue favicon fetches for all link domains in history
 ```
 
-## Release notes
-
-### v0.1.14
-
-- Kept startup, search, filters, notifications, and virtual-list paging off the GTK thread.
-- Rendered full entry text in a scrollable preview pane while keeping list paging light.
-- Coalesced queued list requests and rejected stale results while the user keeps typing.
-
 ## Release and AUR
 
 Build the release archive locally with `./scripts/build-release-archive.sh 0.1.18`.

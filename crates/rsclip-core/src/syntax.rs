@@ -340,33 +340,95 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
     let mut ruby_score = 0;
     let mut lua_score = 0;
 
+    let has_slash_comment = text
+        .lines()
+        .any(|l| l.trim_start().starts_with("//") || l.trim_start().starts_with("/*"));
+    let has_semicolons = text.lines().filter(|l| l.trim_end().ends_with(';')).count() >= 2;
+    let has_braces = text.contains('{') && text.contains('}');
+
     // Rust
     if text.contains("fn ") {
         rust_score += 4;
     }
+    if text.contains("pub fn ")
+        || text.contains("pub struct ")
+        || text.contains("pub enum ")
+        || text.contains("pub trait ")
+        || text.contains("pub const ")
+        || text.contains("pub(crate)")
+    {
+        rust_score += 5;
+    }
     if text.contains("let mut ") {
         rust_score += 5;
     }
-    if text.contains("pub struct ") || text.contains("pub enum ") {
+    if text.contains("let ") {
+        rust_score += 3;
+    }
+    if text.contains("if let ") || text.contains("while let ") {
         rust_score += 5;
     }
     if text.contains("impl ") || text.contains("impl<") {
         rust_score += 4;
     }
     if text.contains("-> Result<") || text.contains("-> Option<") {
+        rust_score += 5;
+    }
+    if text.contains("Some(") || text.contains("Ok(") || text.contains("Err(") {
         rust_score += 4;
     }
-    if text.contains("println!") || text.contains("eprintln!") || text.contains("dbg!") {
+    if text.contains("println!")
+        || text.contains("eprintln!")
+        || text.contains("format!")
+        || text.contains("vec!")
+        || text.contains("panic!")
+        || text.contains("dbg!")
+        || text.contains("assert!")
+    {
         rust_score += 5;
     }
-    if text.contains("use std::") {
+    if text.contains("use std::") || text.contains("use core::") || text.contains("use crate::") {
         rust_score += 5;
     }
-    if text.contains("&mut ") {
+    if [
+        ": usize", ": u32", ": i32", ": u64", ": i64", ": bool", "as usize", "as u32", "as u64",
+        "as i32", "as i64", "u32::", "u64::", "usize::", "i32::", "i64::",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
+    {
+        rust_score += 4;
+    }
+    if [
+        "Vec<",
+        "Vec::",
+        "HashMap<",
+        "HashSet<",
+        "BinaryHeap::",
+        "BinaryHeap<",
+        "BTreeMap<",
+        "Arc<",
+        "Rc<",
+        "Box<",
+        "Option<",
+        "Result<",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
+    {
+        rust_score += 4;
+    }
+    if text.contains("&mut ") || text.contains("&self") || text.contains("&mut self") {
         rust_score += 3;
     }
     if text.contains("match ") && text.contains("=>") {
         rust_score += 4;
+    }
+    if text.contains("#[derive(") || text.contains("#[inline]") || text.contains("#[test]") {
+        rust_score += 6;
+    }
+    if has_slash_comment && (rust_score > 0 || text.contains("Rust") || text.contains("rust")) {
+        rust_score += 2;
     }
 
     // Python
@@ -392,19 +454,29 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
     if text.contains("lambda ") {
         py_score += 3;
     }
-    if text.contains("class ") && text.contains(':') {
+    if text
+        .lines()
+        .any(|l| l.trim().starts_with("class ") && l.trim().ends_with(':'))
+    {
         py_score += 4;
     }
-    if text.contains("else:") {
+    if text.lines().any(|l| l.trim() == "else:") {
         py_score += 4;
     }
-    if (text.contains("while ") || text.contains("if ")) && text.contains(':') {
+    if text.lines().any(|l| {
+        let t = l.trim();
+        (t.starts_with("if ") || t.starts_with("elif ") || t.starts_with("while "))
+            && t.ends_with(':')
+    }) {
         py_score += 4;
     }
-    if text.contains("for ") && text.contains(" in ") && text.contains(':') {
+    if text
+        .lines()
+        .any(|l| l.trim().starts_with("for ") && l.contains(" in ") && l.trim().ends_with(':'))
+    {
         py_score += 4;
     }
-    if text.contains(" // ") || text.contains("// 2") {
+    if (text.contains(" // ") || text.contains("// 2")) && !has_slash_comment {
         py_score += 3;
     }
     if text.contains("sys.stdin") || text.contains("sys.stdout") {
@@ -413,7 +485,7 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
     if text.contains("bisect.") {
         py_score += 5;
     }
-    if text.contains("range(") || text.contains("len(") {
+    if text.contains("range(") || (text.contains("len(") && !text.contains(".len(")) {
         py_score += 3;
     }
     if text.contains("map(int,") || text.contains("map(int, ") {
@@ -428,11 +500,13 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
     if text.contains("is None") || text.contains("is not None") {
         py_score += 5;
     }
-    if text.contains("True") || text.contains("False") || text.contains("None") {
+    if (text.contains("True") || text.contains("False")) && !has_braces {
         py_score += 2;
     }
     if text.lines().any(|l| l.trim_end().ends_with(':'))
         && (text.contains("    ") || text.contains('\t'))
+        && !has_braces
+        && !has_semicolons
     {
         py_score += 3;
     }
@@ -704,6 +778,33 @@ mod tests {
 
         let preview = "low = 0 high = n - 1 while low < high: mid = (low + high) // 2 if nums[mid] > nums[high]: low = mid + 1 else: high = mid print(low)";
         assert_eq!(detect_code_language(preview), Some(CodeLanguage::Python));
+    }
+
+    #[test]
+    fn detects_dijkstra_rust_snippet() {
+        let snippet = r#"// Dijkstra algorithm in Rust
+pub fn shortest_path(graph: &Graph, start: usize, goal: usize) -> Option<u32> {
+    let mut dist: Vec<_> = (0..graph.len()).map(|_| u32::MAX).collect();
+    let mut heap = BinaryHeap::new();
+
+    dist[start] = 0;
+    heap.push(State { cost: 0, position: start });
+
+    while let Some(State { cost, position }) = heap.pop() {
+        if position == goal { return Some(cost); }
+        if cost > dist[position] { continue; }
+
+        for edge in &graph.edges[position] {
+            let next = State { cost: cost + edge.cost, position: edge.node };
+            if next.cost < dist[next.position] {
+                heap.push(next);
+                dist[next.position] = next.cost;
+            }
+        }
+    }
+    None
+}"#;
+        assert_eq!(detect_code_language(snippet), Some(CodeLanguage::Rust));
     }
 
     #[test]
