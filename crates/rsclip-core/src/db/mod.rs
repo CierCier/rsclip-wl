@@ -22,6 +22,7 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        register_sqlite_functions(&conn)?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -34,6 +35,23 @@ impl Database {
         tx.commit()?;
         Ok(value)
     }
+}
+
+fn register_sqlite_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "is_code",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let val = ctx.get::<Option<String>>(0)?;
+            Ok(match val {
+                Some(text) => crate::syntax::detect_code_language(&text).is_some(),
+                None => false,
+            })
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -382,6 +400,39 @@ mod tests {
             }
             _ => panic!("expected full link entry"),
         }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn code_and_text_filter_distinction() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+
+        let prose = "Meeting at 3pm today with team to discuss roadmap";
+        let code = "fn main() {\n    println!(\"Hello world\");\n}";
+
+        db.upsert_entry(&text_entry("hash-prose", prose)).unwrap();
+        db.upsert_entry(&text_entry("hash-code", code)).unwrap();
+
+        let code_entries = db
+            .list_entries("", EntryFilter::Code, SortMode::Default, 10)
+            .unwrap();
+        assert_eq!(code_entries.len(), 1);
+        assert_eq!(code_entries[0].title, code);
+
+        let text_entries = db
+            .list_entries("", EntryFilter::Text, SortMode::Default, 10)
+            .unwrap();
+        assert_eq!(text_entries.len(), 1);
+        assert_eq!(text_entries[0].title, prose);
+
+        assert_eq!(db.count_entries("", EntryFilter::Code).unwrap(), 1);
+        assert_eq!(db.count_entries("", EntryFilter::Text).unwrap(), 1);
+        assert_eq!(db.count_entries("", EntryFilter::All).unwrap(), 2);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

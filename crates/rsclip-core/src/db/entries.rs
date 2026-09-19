@@ -391,7 +391,12 @@ fn entry_select_columns(include_text_payload: bool) -> String {
 fn append_entry_filter(sql: &mut String, filter: EntryFilter) {
     sql.push_str(match filter {
         EntryFilter::All => "",
-        EntryFilter::Text => " AND e.kind = 'text'",
+        EntryFilter::Code => {
+            " AND e.kind = 'text' AND is_code(COALESCE(e.preview_text, e.text_content, e.title)) = 1"
+        }
+        EntryFilter::Text => {
+            " AND e.kind = 'text' AND is_code(COALESCE(e.preview_text, e.text_content, e.title)) = 0"
+        }
         EntryFilter::Images => " AND e.kind = 'image'",
         EntryFilter::Files => " AND e.kind = 'file'",
         EntryFilter::Links => " AND e.kind = 'link'",

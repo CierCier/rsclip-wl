@@ -327,12 +327,13 @@ fn connect_filter(state: &Rc<AppState>) {
     let state = Rc::clone(state);
     filter.connect_selected_notify(move |dropdown| {
         *state.filter.borrow_mut() = match dropdown.selected() {
-            1 => EntryFilter::Text,
-            2 => EntryFilter::Images,
-            3 => EntryFilter::Files,
-            4 => EntryFilter::Links,
-            5 => EntryFilter::Colors,
-            6 => EntryFilter::Pinned,
+            1 => EntryFilter::Code,
+            2 => EntryFilter::Text,
+            3 => EntryFilter::Images,
+            4 => EntryFilter::Files,
+            5 => EntryFilter::Links,
+            6 => EntryFilter::Colors,
+            7 => EntryFilter::Pinned,
             _ => EntryFilter::All,
         };
         if let Err(err) = refresh_entries(&state) {

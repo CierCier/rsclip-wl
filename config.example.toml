@@ -33,7 +33,7 @@ show_footer_hints = true
 reset_on_show = true
 auto_focus_search = true
 start_view = "clipboard"
-# Valid filters: all, text, images, files, links, colors, pinned.
+# Valid filters: all, code, text, images, files, links, colors, pinned.
 default_filter = "all"
 # Valid sorts: default, recent/newest, oldest, type, most-used.
 default_sort = "default"

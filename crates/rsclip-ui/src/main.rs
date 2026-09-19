@@ -5,7 +5,9 @@ mod components;
 mod config_reload;
 mod dialogs;
 mod events;
+mod highlight;
 mod notify;
+
 mod state;
 mod style;
 mod window;

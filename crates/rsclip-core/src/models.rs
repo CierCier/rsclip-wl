@@ -292,6 +292,7 @@ pub struct SecretEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryFilter {
     All,
+    Code,
     Text,
     Images,
     Files,
@@ -303,6 +304,7 @@ pub enum EntryFilter {
 impl EntryFilter {
     pub fn parse(value: &str) -> Self {
         match value {
+            "code" => Self::Code,
             "text" => Self::Text,
             "images" | "image" => Self::Images,
             "files" | "file" => Self::Files,
@@ -317,6 +319,11 @@ impl EntryFilter {
 #[cfg(test)]
 mod tests {
     use super::EntryFilter;
+
+    #[test]
+    fn parses_code_filter() {
+        assert_eq!(EntryFilter::parse("code"), EntryFilter::Code);
+    }
 
     #[test]
     fn parses_file_filter_aliases() {

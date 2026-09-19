@@ -191,7 +191,7 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
             if content.is_none() && matches!(full.data, EntryData::Unknown) {
                 render_text_preview(&state.preview, Some(BINARY_PREVIEW_NOTICE));
             } else {
-                render_text_preview(&state.preview, content);
+                render_text_or_code_preview(&state.preview, content);
             }
         }
     }
@@ -402,6 +402,39 @@ fn full_entry_for_preview(state: &Rc<AppState>, entry: &ClipboardEntry) -> Clipb
 
 fn is_binary_payload(text: &str) -> bool {
     text.as_bytes().contains(&0)
+}
+
+fn render_text_or_code_preview(container: &gtk::Box, text: Option<&str>) {
+    let raw = text.unwrap_or("");
+    if let Some(lang) = rsclip_core::syntax::detect_code_language(raw) {
+        render_code_preview(container, raw, lang);
+    } else {
+        render_text_preview(container, text);
+    }
+}
+
+fn render_code_preview(container: &gtk::Box, text: &str, lang: rsclip_core::syntax::CodeLanguage) {
+    rsclip_core::profiler::begin_phase("render_code_preview");
+    let preview_text = bounded_full_preview(text);
+    let sanitized = if preview_text.contains('\0') {
+        std::borrow::Cow::Owned(preview_text.replace('\0', " "))
+    } else {
+        preview_text
+    };
+
+    let buffer = crate::highlight::setup_source_buffer(&sanitized, lang);
+    let view = crate::highlight::create_source_view(&buffer);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(80)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .propagate_natural_height(false)
+        .child(&view)
+        .build();
+
+    container.append(&scroller);
+    rsclip_core::profiler::end_phase("render_code_preview");
 }
 
 fn render_text_preview(container: &gtk::Box, text: Option<&str>) {

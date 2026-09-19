@@ -173,6 +173,36 @@ listbox row.virtual-spacer-row:selected {
   padding-right: 2px;
 }
 
+.entry-kind-nerd {
+  font-family: "Symbols Nerd Font", "CaskaydiaCove Nerd Font", "JetBrainsMono Nerd Font", monospace;
+  font-size: 15px;
+  min-width: 28px;
+  min-height: 28px;
+  color: @accent;
+}
+
+.badge-nerd-icon {
+  font-family: "Symbols Nerd Font", "CaskaydiaCove Nerd Font", monospace;
+  font-size: 11px;
+}
+
+.sourceview-code {
+  background: @preview_text_bg;
+  border: 1px solid @border_preview;
+  border-radius: 0;
+  color: @text;
+  font-family: "Adwaita Mono", "CaskaydiaCove Nerd Font Mono", monospace;
+  font-size: 12px;
+  padding: 0;
+}
+
+.sourceview-code gutter,
+.sourceview-code gutter > gutterrenderer,
+.sourceview-code gutterrenderer {
+  background: transparent;
+  background-color: transparent;
+}
+
 .link-favicon-slot {
   min-height: 20px;
   min-width: 28px;

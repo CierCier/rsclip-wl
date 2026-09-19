@@ -9,7 +9,22 @@ use crate::components::preview::MAX_FULL_PREVIEW_BYTES;
 
 pub(crate) fn render_details(container: &gtk::Box, entry: &ClipboardEntry) {
     rsclip_core::profiler::begin_phase("render_details");
-    let mut rows = vec![("Type", entry.kind.to_string())];
+    let type_label = if entry.kind == rsclip_core::models::EntryKind::Text {
+        let sample = entry
+            .preview_text
+            .as_deref()
+            .or(entry.text_content.as_deref())
+            .unwrap_or("");
+        if let Some(lang) = rsclip_core::syntax::detect_code_language(sample) {
+            format!("Code ({})", lang.display_name())
+        } else {
+            entry.kind.to_string()
+        }
+    } else {
+        entry.kind.to_string()
+    };
+    let mut rows = vec![("Type", type_label)];
+
     if let EntryData::File { .. } = &entry.data {
         // Same pre-parse bounds as the file preview: counts cover the shown
         // subset, with "+" marking partial results.

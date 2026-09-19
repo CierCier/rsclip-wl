@@ -163,11 +163,12 @@ fn require_command(command: &str) -> Result<()> {
             let candidate = dir.join(command);
             if candidate.is_file() {
                 #[cfg(unix)]
-                if let Ok(metadata) = candidate.metadata() {
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        return Ok(());
-                    }
+                if let Ok(metadata) = candidate.metadata()
+                    && metadata.permissions().mode() & 0o111 != 0
+                {
+                    return Ok(());
                 }
+
                 #[cfg(not(unix))]
                 return Ok(());
             }

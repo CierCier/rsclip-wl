@@ -1,6 +1,6 @@
 [package]
 name = "rsclip-ui"
-version = "0.1.17"
+version = "0.1.18"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,5 +17,7 @@ gio.workspace = true
 glib.workspace = true
 gtk4.workspace = true
 gtk4-layer-shell.workspace = true
+sourceview5.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+

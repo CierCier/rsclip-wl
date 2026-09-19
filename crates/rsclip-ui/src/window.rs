@@ -296,11 +296,12 @@ pub(crate) fn config_sort(value: &str) -> SortMode {
 pub(crate) fn filter_index(filter: EntryFilter) -> u32 {
     match filter {
         EntryFilter::All => 0,
-        EntryFilter::Text => 1,
-        EntryFilter::Images => 2,
-        EntryFilter::Files => 3,
-        EntryFilter::Links => 4,
-        EntryFilter::Colors => 5,
-        EntryFilter::Pinned => 6,
+        EntryFilter::Code => 1,
+        EntryFilter::Text => 2,
+        EntryFilter::Images => 3,
+        EntryFilter::Files => 4,
+        EntryFilter::Links => 5,
+        EntryFilter::Colors => 6,
+        EntryFilter::Pinned => 7,
     }
 }

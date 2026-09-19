@@ -15,6 +15,7 @@ pub mod paste;
 pub mod profiler;
 pub mod secrets;
 pub mod storage;
+pub mod syntax;
 
 pub use classify::classify_payload;
 pub use config::{

@@ -66,11 +66,25 @@ pub fn write_entries(
         writeln!(writer, "{}", serde_json::to_string_pretty(entries)?)?;
     } else {
         for entry in entries {
+            let kind_display = if entry.kind == crate::models::EntryKind::Text {
+                let sample = entry
+                    .preview_text
+                    .as_deref()
+                    .or(entry.text_content.as_deref())
+                    .unwrap_or("");
+                if let Some(lang) = crate::syntax::detect_code_language(sample) {
+                    lang.display_name()
+                } else {
+                    entry.kind.as_str()
+                }
+            } else {
+                entry.kind.as_str()
+            };
             writeln!(
                 writer,
                 "#{:<4} {:<6} {:<1} {}",
                 entry.id,
-                entry.kind,
+                kind_display,
                 if entry.pinned { "P" } else { " " },
                 entry.title
             )?;
@@ -135,6 +149,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_code_filter() {
+        let args = make_args(&["--filter", "code"]);
+        let parsed = parse_list_entries_args(&args);
+
+        assert_eq!(parsed.filter, EntryFilter::Code);
+    }
+
+    #[test]
     fn parses_files_filter() {
         let args = make_args(&["--filter", "files"]);
         let parsed = parse_list_entries_args(&args);
@@ -154,6 +176,15 @@ mod tests {
     fn writes_plain_entries() {
         let mut output = Vec::new();
         write_entries(&mut output, &[text_entry()], false).unwrap();
-        assert_eq!(String::from_utf8(output).unwrap(), "#7    text P Title\n");
+        assert_eq!(String::from_utf8(output).unwrap(), "#7    text   P Title\n");
+    }
+
+    #[test]
+    fn writes_code_entries_with_detected_language() {
+        let mut entry = text_entry();
+        entry.preview_text = Some("fn main() {\n    println!(\"hello\");\n}".to_string());
+        let mut output = Vec::new();
+        write_entries(&mut output, &[entry], false).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "#7    Rust   P Title\n");
     }
 }

@@ -39,7 +39,7 @@ Commands:
 List options:
   --json                  Print JSON
   --query <query>         Filter by query
-  --filter <filter>       all, text, images, files, links, colors, pinned
+  --filter <filter>       all, code, text, images, files, links, colors, pinned
   --sort <sort>           default, recent/newest, oldest, type, most-used
   --limit <limit>         Maximum entries to print
 "#

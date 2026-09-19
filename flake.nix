@@ -79,6 +79,7 @@
           buildInputs = [
             pkgs.gtk4
             pkgs.gtk4-layer-shell
+            pkgs.gtksourceview5
           ];
 
           nativeBuildInputs = [

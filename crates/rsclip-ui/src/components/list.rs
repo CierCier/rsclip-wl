@@ -65,7 +65,7 @@ pub(crate) fn entry_row(entry: &ClipboardEntry, favicon_icon_dir: &Path) -> gtk:
     outer.append(&text);
 
     if entry.pinned {
-        let pinned = badge_icon("view-pin-symbolic", "Pinned");
+        let pinned = badge_icon("\u{f08d}", "Pinned");
         outer.append(&pinned);
     }
 
@@ -101,15 +101,23 @@ pub(crate) fn secret_row(secret: &SecretEntry) -> gtk::ListBoxRow {
     row
 }
 
-fn row_icon(icon_name: &str, tooltip: &str) -> gtk::Image {
-    let icon = gtk::Image::from_icon_name(icon_name);
-    icon.add_css_class("entry-kind");
-    icon.set_tooltip_text(Some(tooltip));
-    icon.set_pixel_size(16);
-    icon
+fn nerd_icon(glyph: &str, color: Option<&str>, tooltip: &str) -> gtk::Widget {
+    let label = gtk::Label::new(None);
+    label.add_css_class("entry-kind-nerd");
+    label.set_tooltip_text(Some(tooltip));
+    label.set_width_request(28);
+    label.set_halign(gtk::Align::Center);
+    label.set_valign(gtk::Align::Center);
+
+    if let Some(color) = color {
+        label.set_markup(&format!("<span foreground=\"{color}\">{glyph}</span>"));
+    } else {
+        label.set_text(glyph);
+    }
+    label.upcast()
 }
 
-fn badge_icon(icon_name: &str, tooltip: &str) -> gtk::Widget {
+fn badge_icon(glyph: &str, tooltip: &str) -> gtk::Widget {
     let badge = gtk::CenterBox::new();
     badge.add_css_class("kind-badge");
     badge.set_tooltip_text(Some(tooltip));
@@ -118,18 +126,21 @@ fn badge_icon(icon_name: &str, tooltip: &str) -> gtk::Widget {
     badge.set_halign(gtk::Align::Center);
     badge.set_valign(gtk::Align::Center);
 
-    let icon = gtk::Image::from_icon_name(icon_name);
-    icon.set_pixel_size(12);
-    icon.set_halign(gtk::Align::Center);
-    icon.set_valign(gtk::Align::Center);
-    badge.set_center_widget(Some(&icon));
+    let label = gtk::Label::new(Some(glyph));
+    label.add_css_class("badge-nerd-icon");
+    label.set_halign(gtk::Align::Center);
+    label.set_valign(gtk::Align::Center);
+    badge.set_center_widget(Some(&label));
     badge.upcast()
 }
 
 fn entry_icon(entry: &ClipboardEntry, favicon_icon_dir: &Path) -> gtk::Widget {
     match &entry.data {
         EntryData::Link { domain, .. } => link_icon(favicon_icon_dir, domain),
-        _ => row_icon(entry_icon_name(entry), entry_kind_label(entry)).upcast(),
+        _ => {
+            let (glyph, color, tooltip) = resolved_entry_nerd_icon_and_label(entry);
+            nerd_icon(glyph, color.as_deref(), &tooltip)
+        }
     }
 }
 
@@ -149,9 +160,9 @@ fn link_icon(favicon_icon_dir: &Path, domain: &str) -> gtk::Widget {
         }
     }
 
-    let fallback = gtk::Label::new(Some(&domain_initial(domain)));
+    let fallback = gtk::Label::new(Some("\u{f0c1}"));
     fallback.add_css_class("link-favicon");
-    fallback.add_css_class("favicon-fallback");
+    fallback.add_css_class("entry-kind-nerd");
     fallback.set_width_request(FAVICON_SIZE);
     fallback.set_height_request(FAVICON_SIZE);
     fallback.set_halign(gtk::Align::Center);
@@ -177,36 +188,32 @@ fn domain_tooltip(domain: &str) -> &str {
     if domain.is_empty() { "Link" } else { domain }
 }
 
-fn domain_initial(domain: &str) -> String {
-    domain
-        .split('.')
-        .find_map(|label| label.chars().find(|ch| ch.is_ascii_alphanumeric()))
-        .map(|ch| ch.to_ascii_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string())
-}
-
-fn entry_icon_name(entry: &ClipboardEntry) -> &'static str {
+fn resolved_entry_nerd_icon_and_label(
+    entry: &ClipboardEntry,
+) -> (&'static str, Option<String>, String) {
     match &entry.data {
+        EntryData::Color { value, .. } => ("\u{f53f}", Some(value.clone()), "Color".to_string()),
+        EntryData::File { .. } => ("\u{f07b}", Some("#79b8ff".to_string()), "File".to_string()),
+        EntryData::Image { .. } => ("\u{f03e}", Some("#85e89d".to_string()), "Image".to_string()),
+        EntryData::Text | EntryData::Unknown => {
+            let sample = entry
+                .preview_text
+                .as_deref()
+                .or(entry.text_content.as_deref())
+                .unwrap_or("");
+            if let Some(lang) = rsclip_core::syntax::detect_code_language(sample) {
+                (
+                    lang.nerd_icon(),
+                    Some(lang.nerd_color().to_string()),
+                    lang.display_name().to_string(),
+                )
+            } else if matches!(entry.data, EntryData::Unknown) {
+                ("\u{f059}", None, "Unknown".to_string())
+            } else {
+                ("\u{f0219}", None, "Text".to_string())
+            }
+        }
         EntryData::Link { .. } => unreachable!(),
-        _ => match entry.kind {
-            EntryKind::Text => "text-x-generic-symbolic",
-            EntryKind::Image => "image-x-generic-symbolic",
-            EntryKind::Color => "color-select-symbolic",
-            EntryKind::File => "folder-symbolic",
-            EntryKind::Unknown => "dialog-question-symbolic",
-            EntryKind::Link => unreachable!(),
-        },
-    }
-}
-
-fn entry_kind_label(entry: &ClipboardEntry) -> &'static str {
-    match entry.kind {
-        EntryKind::Text => "Text",
-        EntryKind::Image => "Image",
-        EntryKind::Link => "Link",
-        EntryKind::Color => "Color",
-        EntryKind::File => "File",
-        EntryKind::Unknown => "Unknown",
     }
 }
 
@@ -217,7 +224,19 @@ fn subtitle(entry: &ClipboardEntry) -> String {
         return subtitle;
     }
 
-    relative_time(entry.updated_at)
+    let time = relative_time(entry.updated_at);
+    if entry.kind == EntryKind::Text {
+        let sample = entry
+            .preview_text
+            .as_deref()
+            .or(entry.text_content.as_deref())
+            .unwrap_or("");
+        if let Some(lang) = rsclip_core::syntax::detect_code_language(sample) {
+            return format!("{time} • {}", lang.display_name());
+        }
+    }
+
+    time
 }
 
 fn file_subtitle(entry: &ClipboardEntry) -> Option<String> {
@@ -239,5 +258,52 @@ fn file_count_label(count: usize) -> String {
         "1 file".to_string()
     } else {
         format!("{count} files")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_entry(id: i64, text: &str) -> ClipboardEntry {
+        ClipboardEntry {
+            id,
+            content_hash: format!("hash-{id}"),
+            kind: EntryKind::Text,
+            mime_type: "text/plain".to_string(),
+            title: text.to_string(),
+            preview_text: Some(text.to_string()),
+            text_content: Some(text.to_string()),
+            pinned: false,
+            copied_at: 1700000000,
+            updated_at: 1700000000,
+            last_used_at: None,
+            use_count: 0,
+            size_bytes: 100,
+            data: EntryData::Text,
+        }
+    }
+
+    #[test]
+    fn text_entry_with_code_resolves_language_icon_and_label() {
+        let entry = test_entry(1, "fn main() {\n    println!(\"hi\");\n}");
+        let (glyph, color, label) = resolved_entry_nerd_icon_and_label(&entry);
+        assert_eq!(label, "Rust");
+        assert_eq!(glyph, "\u{e7a8}");
+        assert!(color.is_some());
+
+        let sub = subtitle(&entry);
+        assert!(sub.contains("Rust"));
+    }
+
+    #[test]
+    fn plain_text_entry_resolves_text_icon_and_label() {
+        let entry = test_entry(2, "Meeting at 3pm today with Alice");
+        let (glyph, _color, label) = resolved_entry_nerd_icon_and_label(&entry);
+        assert_eq!(label, "Text");
+        assert_eq!(glyph, "\u{f0219}");
+
+        let sub = subtitle(&entry);
+        assert!(!sub.contains("•"));
     }
 }

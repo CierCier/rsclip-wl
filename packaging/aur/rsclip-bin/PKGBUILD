@@ -10,6 +10,7 @@ depends=(
   'glibc'
   'gtk4'
   'gtk4-layer-shell'
+  'gtksourceview5'
 )
 optdepends=(
   'tesseract: OCR support'

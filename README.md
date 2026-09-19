@@ -33,10 +33,10 @@ paru -S rsclip-bin
 cargo build
 ```
 
-On Arch/CachyOS, the GTK4 layer-shell system dependency is required for the overlay UI:
+On Arch/CachyOS, the GTK4 layer-shell and gtksourceview5 system dependencies are required:
 
 ```bash
-sudo pacman -S gtk4-layer-shell
+sudo pacman -S gtk4-layer-shell gtksourceview5
 ```
 
 ## Nix
@@ -241,7 +241,7 @@ secrets_search_placeholder = "Search secrets by name..."
 
 UI configuration details:
 - `start_view`: Initial tab when opening the overlay (`"clipboard"` or `"secrets"`).
-- `default_filter`: Filter applied on launch/reset (`all`, `text`, `images`, `files`, `links`, `colors`, `pinned`).
+- `default_filter`: Filter applied on launch/reset (`all`, `code`, `text`, `images`, `files`, `links`, `colors`, `pinned`).
 - `default_sort`: History ordering (`default` [pinned first, then newest], `recent`/`newest`, `oldest`, `type`, `most-used`).
 - `reset_on_show`: Reset search query, view, and filters whenever the overlay is shown.
 - `auto_focus_search`: Automatically focus the search bar upon opening.
@@ -308,6 +308,6 @@ rsclipd favicons refresh    # re-queue favicon fetches for all link domains in h
 
 ## Release and AUR
 
-Build the release archive locally with `./scripts/build-release-archive.sh 0.1.17`.
-Pushing a matching `v0.1.17` tag runs the release workflow, publishes the archive,
+Build the release archive locally with `./scripts/build-release-archive.sh 0.1.18`.
+Pushing a matching `v0.1.18` tag runs the release workflow, publishes the archive,
 and updates the `rsclip-bin` AUR package.
