@@ -326,7 +326,116 @@ fn detect_markdown(text: &str) -> bool {
         || (has_fences && (has_links || has_bullets))
 }
 
+struct CodeTokens<'a> {
+    tokens: std::collections::HashSet<&'a str>,
+    has_c_comments: bool,
+    has_hash_comments: bool,
+    #[allow(dead_code)]
+    has_dash_comments: bool,
+    has_braces: bool,
+    has_semicolons: bool,
+    has_py_blocks: bool,
+}
+
+fn tokenize_code(text: &str) -> CodeTokens<'_> {
+    let mut tokens = std::collections::HashSet::new();
+    let mut has_c_comments = false;
+    let mut has_hash_comments = false;
+    let mut has_dash_comments = false;
+    let mut semicolon_line_count = 0;
+    let mut has_py_blocks = false;
+
+    let has_braces = text.contains('{') && text.contains('}');
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            has_c_comments = true;
+        } else if trimmed.starts_with('#')
+            && !trimmed.starts_with("#!")
+            && !trimmed.starts_with("#include")
+            && !trimmed.starts_with("#define")
+            && !trimmed.starts_with("#[")
+        {
+            has_hash_comments = true;
+        } else if trimmed.starts_with("--") {
+            has_dash_comments = true;
+        }
+
+        if trimmed.ends_with(';') {
+            semicolon_line_count += 1;
+        }
+
+        if trimmed.ends_with(':') {
+            let prefixes = [
+                "def ", "class ", "if ", "elif ", "while ", "for ", "try:", "except", "with ",
+                "else:", "finally:",
+            ];
+            if prefixes.iter().any(|p| trimmed.starts_with(p)) {
+                has_py_blocks = true;
+            }
+        } else if trimmed.contains("else:")
+            || (!has_braces
+                && (trimmed.contains("while ") || trimmed.contains("elif "))
+                && trimmed.contains(':'))
+        {
+            has_py_blocks = true;
+        }
+
+        let code_part = if let Some(idx) = trimmed.find("//") {
+            &trimmed[..idx]
+        } else if let Some(idx) = trimmed.find('#') {
+            if trimmed.starts_with("#include")
+                || trimmed.starts_with("#define")
+                || trimmed.starts_with("#[")
+            {
+                trimmed
+            } else {
+                &trimmed[..idx]
+            }
+        } else {
+            trimmed
+        };
+
+        for word in code_part.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if !word.is_empty() {
+                tokens.insert(word);
+            }
+        }
+    }
+
+    CodeTokens {
+        tokens,
+        has_c_comments,
+        has_hash_comments,
+        has_dash_comments,
+        has_braces,
+        has_semicolons: semicolon_line_count >= 2,
+        has_py_blocks,
+    }
+}
+
 fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
+    let code_char_count = text
+        .chars()
+        .filter(|c| {
+            matches!(
+                c,
+                '{' | '}' | ';' | '(' | ')' | '[' | ']' | '=' | '<' | '>' | ':' | '$' | '#'
+            )
+        })
+        .count();
+    if code_char_count == 0 {
+        return None;
+    }
+
+    let parsed = tokenize_code(text);
+    let t = &parsed.tokens;
+
     let mut rust_score = 0;
     let mut py_score = 0;
     let mut js_score = 0;
@@ -340,318 +449,307 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
     let mut ruby_score = 0;
     let mut lua_score = 0;
 
-    let has_slash_comment = text
-        .lines()
-        .any(|l| l.trim_start().starts_with("//") || l.trim_start().starts_with("/*"));
-    let has_semicolons = text.lines().filter(|l| l.trim_end().ends_with(';')).count() >= 2;
-    let has_braces = text.contains('{') && text.contains('}');
-
-    // Rust
-    if text.contains("fn ") {
-        rust_score += 4;
-    }
-    if text.contains("pub fn ")
-        || text.contains("pub struct ")
-        || text.contains("pub enum ")
-        || text.contains("pub trait ")
-        || text.contains("pub const ")
-        || text.contains("pub(crate)")
+    // === RUST ===
+    if !parsed.has_py_blocks && !t.contains("def") && !t.contains("elif") && !t.contains("package")
     {
-        rust_score += 5;
-    }
-    if text.contains("let mut ") {
-        rust_score += 5;
-    }
-    if text.contains("let ") {
-        rust_score += 3;
-    }
-    if text.contains("if let ") || text.contains("while let ") {
-        rust_score += 5;
-    }
-    if text.contains("impl ") || text.contains("impl<") {
-        rust_score += 4;
-    }
-    if text.contains("-> Result<") || text.contains("-> Option<") {
-        rust_score += 5;
-    }
-    if text.contains("Some(") || text.contains("Ok(") || text.contains("Err(") {
-        rust_score += 4;
-    }
-    if text.contains("println!")
-        || text.contains("eprintln!")
-        || text.contains("format!")
-        || text.contains("vec!")
-        || text.contains("panic!")
-        || text.contains("dbg!")
-        || text.contains("assert!")
-    {
-        rust_score += 5;
-    }
-    if text.contains("use std::") || text.contains("use core::") || text.contains("use crate::") {
-        rust_score += 5;
-    }
-    if [
-        ": usize", ": u32", ": i32", ": u64", ": i64", ": bool", "as usize", "as u32", "as u64",
-        "as i32", "as i64", "u32::", "u64::", "usize::", "i32::", "i64::",
-    ]
-    .iter()
-    .any(|k| text.contains(k))
-    {
-        rust_score += 4;
-    }
-    if [
-        "Vec<",
-        "Vec::",
-        "HashMap<",
-        "HashSet<",
-        "BinaryHeap::",
-        "BinaryHeap<",
-        "BTreeMap<",
-        "Arc<",
-        "Rc<",
-        "Box<",
-        "Option<",
-        "Result<",
-    ]
-    .iter()
-    .any(|k| text.contains(k))
-    {
-        rust_score += 4;
-    }
-    if text.contains("&mut ") || text.contains("&self") || text.contains("&mut self") {
-        rust_score += 3;
-    }
-    if text.contains("match ") && text.contains("=>") {
-        rust_score += 4;
-    }
-    if text.contains("#[derive(") || text.contains("#[inline]") || text.contains("#[test]") {
-        rust_score += 6;
-    }
-    if has_slash_comment && (rust_score > 0 || text.contains("Rust") || text.contains("rust")) {
-        rust_score += 2;
-    }
-
-    // Python
-    if text.contains("def ") {
-        py_score += 5;
-    }
-    if text.contains("import ") || text.contains("from ") {
-        py_score += 2;
-    }
-    if text.contains("elif ") || text.contains("elif:") {
-        py_score += 4;
-    }
-    if text.contains("if __name__ == '__main__':") || text.contains("if __name__ == \"__main__\":")
-    {
-        py_score += 6;
-    }
-    if text.contains("print(") {
-        py_score += 3;
-    }
-    if text.contains("self.") {
-        py_score += 3;
-    }
-    if text.contains("lambda ") {
-        py_score += 3;
-    }
-    if text
-        .lines()
-        .any(|l| l.trim().starts_with("class ") && l.trim().ends_with(':'))
-    {
-        py_score += 4;
-    }
-    if text.lines().any(|l| l.trim() == "else:") {
-        py_score += 4;
-    }
-    if text.lines().any(|l| {
-        let t = l.trim();
-        (t.starts_with("if ") || t.starts_with("elif ") || t.starts_with("while "))
-            && t.ends_with(':')
-    }) {
-        py_score += 4;
-    }
-    if text
-        .lines()
-        .any(|l| l.trim().starts_with("for ") && l.contains(" in ") && l.trim().ends_with(':'))
-    {
-        py_score += 4;
-    }
-    if (text.contains(" // ") || text.contains("// 2")) && !has_slash_comment {
-        py_score += 3;
-    }
-    if text.contains("sys.stdin") || text.contains("sys.stdout") {
-        py_score += 5;
-    }
-    if text.contains("bisect.") {
-        py_score += 5;
-    }
-    if text.contains("range(") || (text.contains("len(") && !text.contains(".len(")) {
-        py_score += 3;
-    }
-    if text.contains("map(int,") || text.contains("map(int, ") {
-        py_score += 4;
-    }
-    if text.contains("int(input())")
-        || text.contains("input().split()")
-        || text.contains("int(data[")
-    {
-        py_score += 5;
-    }
-    if text.contains("is None") || text.contains("is not None") {
-        py_score += 5;
-    }
-    if (text.contains("True") || text.contains("False")) && !has_braces {
-        py_score += 2;
-    }
-    if text.lines().any(|l| l.trim_end().ends_with(':'))
-        && (text.contains("    ") || text.contains('\t'))
-        && !has_braces
-        && !has_semicolons
-    {
-        py_score += 3;
+        if t.contains("fn") {
+            rust_score += 5;
+        }
+        if t.contains("pub") {
+            rust_score += 4;
+        }
+        if t.contains("let") {
+            rust_score += 3;
+        }
+        if t.contains("mut") {
+            rust_score += 4;
+        }
+        if t.contains("impl") {
+            rust_score += 5;
+        }
+        if t.contains("trait") {
+            rust_score += 5;
+        }
+        if t.contains("struct") && (t.contains("pub") || parsed.has_braces) {
+            rust_score += 4;
+        }
+        if t.contains("enum") && (t.contains("pub") || parsed.has_braces) {
+            rust_score += 4;
+        }
+        if t.contains("match") && text.contains("=>") {
+            rust_score += 5;
+        }
+        if t.contains("unsafe") {
+            rust_score += 3;
+        }
+        let rust_types = [
+            "usize", "u8", "u16", "u32", "u64", "u128", "isize", "i8", "i16", "i32", "i64", "bool",
+        ];
+        if rust_types.iter().any(|ty| t.contains(ty)) {
+            rust_score += 4;
+        }
+        let rust_patterns = [
+            "-> Option<",
+            "-> Result<",
+            "Some(",
+            "Ok(",
+            "Err(",
+            "Vec<",
+            "BinaryHeap::",
+            "HashMap<",
+            "Arc<",
+            "Rc<",
+            "Box<",
+            "::",
+        ];
+        if rust_patterns.iter().any(|p| text.contains(p)) {
+            rust_score += 4;
+        }
+        let rust_macros = [
+            "println!",
+            "eprintln!",
+            "format!",
+            "vec!",
+            "panic!",
+            "dbg!",
+            "assert!",
+        ];
+        if rust_macros.iter().any(|m| text.contains(m)) {
+            rust_score += 5;
+        }
+        if text.contains("use std::") || text.contains("use core::") || text.contains("use crate::")
+        {
+            rust_score += 5;
+        }
+        if text.contains("#[derive(") || text.contains("#[inline]") || text.contains("#[test]") {
+            rust_score += 6;
+        }
+        if parsed.has_c_comments && rust_score > 0 {
+            rust_score += 2;
+        }
+        if parsed.has_braces && rust_score > 0 {
+            rust_score += 2;
+        }
     }
 
-    // Go
-    if text.contains("package ") {
-        go_score += 4;
-    }
-    if text.contains("func ") || text.contains("func(") {
-        go_score += 5;
-    }
-    if text.contains("fmt.Println") || text.contains("fmt.Printf") {
-        go_score += 5;
-    }
-    if text.contains(":=") {
-        go_score += 4;
-    }
-    if text.contains("go func") {
-        go_score += 5;
-    }
-    if text.contains("type ") && text.contains("struct {") {
-        go_score += 5;
+    // === PYTHON ===
+    let py_disqualified = parsed.has_c_comments
+        || (parsed.has_braces
+            && ["fn ", "pub ", "void ", "int ", "namespace ", "interface "]
+                .iter()
+                .any(|k| text.contains(k)))
+        || (parsed.has_semicolons && parsed.has_braces);
+
+    if !py_disqualified {
+        if t.contains("def") {
+            py_score += 6;
+        }
+        if t.contains("class") {
+            py_score += 5;
+        }
+        if t.contains("elif") {
+            py_score += 5;
+        }
+        if t.contains("import") || t.contains("from") {
+            py_score += 2;
+        }
+        if t.contains("lambda") {
+            py_score += 4;
+        }
+        if t.contains("self") {
+            py_score += 3;
+        }
+        if t.contains("print") && text.contains('(') {
+            py_score += 3;
+        }
+        if parsed.has_py_blocks {
+            py_score += 6;
+        }
+        if text.contains("else:") {
+            py_score += 4;
+        }
+        if text.contains("if __name__ == '__main__':")
+            || text.contains("if __name__ == \"__main__\":")
+        {
+            py_score += 6;
+        }
+        if text.contains("is None") || text.contains("is not None") {
+            py_score += 5;
+        }
+        if (t.contains("True") || t.contains("False") || t.contains("None")) && !parsed.has_braces {
+            py_score += 3;
+        }
+        if ["int(input())", "input().split()", "sys.stdin", "bisect."]
+            .iter()
+            .any(|k| text.contains(k))
+        {
+            py_score += 5;
+        }
+        if (text.contains(" // ") || text.contains("// 2")) && !parsed.has_c_comments {
+            py_score += 3;
+        }
+        if parsed.has_hash_comments && py_score > 0 {
+            py_score += 2;
+        }
     }
 
-    // JavaScript / TypeScript
-    let has_const_let = text.contains("const ") || text.contains("let ");
-    if has_const_let {
-        js_score += 2;
-        ts_score += 2;
-    }
-    if text.contains("console.log(") {
-        js_score += 4;
-        ts_score += 4;
-    }
-    if text.contains("export default ") || text.contains("export const ") {
-        js_score += 4;
-        ts_score += 4;
-    }
-    if text.contains("async ") && text.contains("await ") {
-        js_score += 3;
-        ts_score += 3;
-    }
-    if text.contains("function ") || text.contains("function(") {
-        js_score += 3;
-        ts_score += 3;
-    }
-    if text.contains("=> {") || text.contains("=> (") {
-        js_score += 2;
-        ts_score += 2;
-    }
-    if text.contains("interface ") || text.contains("type ") && text.contains(" = ") {
-        ts_score += 5;
-    }
-    if text.contains(": string") || text.contains(": number") || text.contains(": boolean") {
-        ts_score += 4;
-    }
-    if text.contains("as const") {
-        ts_score += 4;
+    // === GO ===
+    if !parsed.has_py_blocks && !t.contains("def") && !t.contains("fn") {
+        if t.contains("package") {
+            go_score += 6;
+        }
+        if t.contains("func") {
+            go_score += 5;
+        }
+        if t.contains("chan") {
+            go_score += 5;
+        }
+        if t.contains("defer") {
+            go_score += 5;
+        }
+        if text.contains(":=") {
+            go_score += 5;
+        }
+        if text.contains("fmt.Println") || text.contains("fmt.Printf") {
+            go_score += 5;
+        }
+        if t.contains("go") && t.contains("func") {
+            go_score += 4;
+        }
+        if text.contains("struct {") && t.contains("type") {
+            go_score += 5;
+        }
     }
 
-    // C / C++
-    if text.contains("#include <") || text.contains("#include \"") {
-        c_score += 5;
-        cpp_score += 5;
-    }
-    if text.contains("#define ") {
-        c_score += 3;
-        cpp_score += 3;
-    }
-    if text.contains("int main(") || text.contains("int main ()") {
-        c_score += 4;
-        cpp_score += 4;
-    }
-    if text.contains("printf(") {
-        c_score += 3;
-    }
-    if text.contains("std::") {
-        cpp_score += 5;
-    }
-    if text.contains("cout <<") || text.contains("cin >>") {
-        cpp_score += 5;
-    }
-    if text.contains("template <") || text.contains("template<") {
-        cpp_score += 5;
-    }
-    if text.contains("nullptr") {
-        cpp_score += 4;
-    }
-
-    // Java / C#
-    if text.contains("public static void main") {
-        java_score += 6;
-        cs_score += 4;
-    }
-    if text.contains("System.out.println") {
-        java_score += 6;
-    }
-    if text.contains("public class ") {
-        java_score += 3;
-        cs_score += 3;
-    }
-    if text.contains("using System;") || text.contains("namespace ") {
-        cs_score += 5;
-    }
-    if text.contains("Console.WriteLine") {
-        cs_score += 5;
+    // === TYPESCRIPT & JAVASCRIPT ===
+    if !parsed.has_py_blocks && !t.contains("def") && !t.contains("fn") && !t.contains("package") {
+        let has_js_var = t.contains("const") || t.contains("let") || t.contains("var");
+        if has_js_var {
+            js_score += 2;
+            ts_score += 2;
+        }
+        if t.contains("function") {
+            js_score += 4;
+            ts_score += 4;
+        }
+        if text.contains("console.log(") {
+            js_score += 5;
+            ts_score += 5;
+        }
+        if t.contains("export") || t.contains("import") {
+            js_score += 2;
+            ts_score += 2;
+        }
+        if text.contains("=>") {
+            js_score += 3;
+            ts_score += 3;
+        }
+        if t.contains("interface") {
+            ts_score += 6;
+        }
+        if [": string", ": number", ": boolean", ": any", "as const"]
+            .iter()
+            .any(|k| text.contains(k))
+        {
+            ts_score += 5;
+        }
     }
 
-    // Shell / Bash
-    if text.contains("echo ") {
-        sh_score += 2;
-    }
-    if text.contains("sudo ") || text.contains("chmod ") {
-        sh_score += 4;
-    }
-    if text.contains("curl ") && (text.contains(" | ") || text.contains(" -")) {
-        sh_score += 4;
-    }
-    if text.contains("export ") && text.contains('=') {
-        sh_score += 4;
-    }
-    if text.contains("if [ ") && (text.contains("then") || text.contains("fi")) {
-        sh_score += 5;
-    }
-
-    // Ruby
-    if text.contains("def ") && text.contains("end\n") {
-        ruby_score += 4;
-    }
-    if text.contains("attr_accessor ") {
-        ruby_score += 5;
-    }
-    if text.contains("puts ") {
-        ruby_score += 2;
-    }
-
-    // Lua
-    if text.contains("local ") && (text.contains("function") || text.contains('=')) {
-        lua_score += 4;
-    }
-    if text.contains("nil") && text.contains("then") {
-        lua_score += 4;
+    // === C & C++ ===
+    if !parsed.has_py_blocks && !t.contains("def") && !t.contains("fn") && !t.contains("package") {
+        if text.contains("#include <") || text.contains("#include \"") {
+            c_score += 6;
+            cpp_score += 6;
+        }
+        if text.contains("#define ") {
+            c_score += 4;
+            cpp_score += 4;
+        }
+        if text.contains("int main(") || text.contains("int main ()") {
+            c_score += 5;
+            cpp_score += 5;
+        }
+        if text.contains("printf(") {
+            c_score += 4;
+        }
+        if text.contains("std::") {
+            cpp_score += 6;
+        }
+        if text.contains("cout <<") || text.contains("cin >>") {
+            cpp_score += 6;
+        }
+        if text.contains("template <") || text.contains("template<") {
+            cpp_score += 6;
+        }
+        if t.contains("nullptr") {
+            cpp_score += 5;
+        }
     }
 
-    let scores = [
+    // === JAVA & C# ===
+    if !parsed.has_py_blocks && !t.contains("def") && !t.contains("fn") {
+        if text.contains("public static void main") {
+            java_score += 6;
+            cs_score += 4;
+        }
+        if text.contains("System.out.println") {
+            java_score += 6;
+        }
+        if text.contains("public class ") {
+            java_score += 3;
+            cs_score += 3;
+        }
+        if text.contains("using System;") || text.contains("namespace ") {
+            cs_score += 6;
+        }
+        if text.contains("Console.WriteLine") {
+            cs_score += 6;
+        }
+    }
+
+    // === SHELL ===
+    if !parsed.has_braces && !parsed.has_py_blocks {
+        if text.contains("sudo ") || text.contains("chmod ") {
+            sh_score += 4;
+        }
+        if text.contains("curl ") && (text.contains(" | ") || text.contains(" -")) {
+            sh_score += 4;
+        }
+        if text.contains("export ") && text.contains('=') {
+            sh_score += 4;
+        }
+        if text.contains("if [ ") && (text.contains("then") || text.contains("fi")) {
+            sh_score += 5;
+        }
+        if text.contains("echo ") {
+            sh_score += 2;
+        }
+    }
+
+    // === RUBY ===
+    if !parsed.has_c_comments && !parsed.has_braces {
+        if text.contains("def ") && text.contains("end") {
+            ruby_score += 5;
+        }
+        if text.contains("attr_accessor ") {
+            ruby_score += 5;
+        }
+        if text.contains("puts ") {
+            ruby_score += 3;
+        }
+    }
+
+    // === LUA ===
+    if !parsed.has_c_comments && !parsed.has_py_blocks {
+        if text.contains("local ") && (text.contains("function") || text.contains('=')) {
+            lua_score += 5;
+        }
+        if text.contains("nil") && text.contains("then") {
+            lua_score += 4;
+        }
+    }
+
+    let mut scores = [
         (rust_score, CodeLanguage::Rust),
         (py_score, CodeLanguage::Python),
         (ts_score, CodeLanguage::TypeScript),
@@ -666,28 +764,41 @@ fn score_programming_languages(text: &str) -> Option<CodeLanguage> {
         (lua_score, CodeLanguage::Lua),
     ];
 
-    let (max_score, candidate) = scores.iter().max_by_key(|(s, _)| *s).copied()?;
+    scores.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let (top_score, winner) = scores[0];
+    let (second_score, runner_up) = scores[1];
 
-    // Strict threshold: score must be at least 4
-    if max_score < 4 {
+    if top_score < 4 {
         return None;
     }
 
-    // Presence of code-like characters helps reject plain English sentences
-    let code_char_count = text
-        .chars()
-        .filter(|c| {
-            matches!(
-                c,
-                '{' | '}' | ';' | '(' | ')' | '[' | ']' | '=' | '<' | '>' | ':' | '$'
-            )
-        })
-        .count();
-    if code_char_count == 0 {
+    if top_score == second_score && top_score > 0 {
+        if (winner == CodeLanguage::TypeScript && runner_up == CodeLanguage::JavaScript)
+            || (winner == CodeLanguage::JavaScript && runner_up == CodeLanguage::TypeScript)
+        {
+            return if ts_score > 0 && ts_score >= js_score {
+                Some(CodeLanguage::TypeScript)
+            } else {
+                Some(CodeLanguage::JavaScript)
+            };
+        }
+        if (winner == CodeLanguage::Cpp && runner_up == CodeLanguage::C)
+            || (winner == CodeLanguage::C && runner_up == CodeLanguage::Cpp)
+        {
+            return if cpp_score > c_score {
+                Some(CodeLanguage::Cpp)
+            } else {
+                Some(CodeLanguage::C)
+            };
+        }
         return None;
     }
 
-    Some(candidate)
+    if top_score < 7 && (top_score - second_score) < 2 {
+        return None;
+    }
+
+    Some(winner)
 }
 
 #[cfg(test)]
@@ -814,5 +925,26 @@ pub fn shortest_path(graph: &Graph, start: usize, goal: usize) -> Option<u32> {
 
         let random_sentence = "This is a simple note without any code or brackets or keywords.";
         assert_eq!(detect_code_language(random_sentence), None);
+
+        let sentence_with_keywords = "Let me know if you can meet while I am in town for the conference. We can talk about rust.";
+        assert_eq!(detect_code_language(sentence_with_keywords), None);
+    }
+
+    #[test]
+    fn c_comments_disqualify_python() {
+        let snippet = "// This is a C++ or Rust file\nint x = 10;\nwhile (x > 0) {\n    x--;\n}";
+        assert_ne!(detect_code_language(snippet), Some(CodeLanguage::Python));
+    }
+
+    #[test]
+    fn short_rust_function_detected() {
+        let snippet = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}";
+        assert_eq!(detect_code_language(snippet), Some(CodeLanguage::Rust));
+    }
+
+    #[test]
+    fn short_python_function_detected() {
+        let snippet = "def add(a, b):\n    return a + b";
+        assert_eq!(detect_code_language(snippet), Some(CodeLanguage::Python));
     }
 }
