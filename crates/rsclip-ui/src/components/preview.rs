@@ -1,12 +1,14 @@
 use std::rc::Rc;
 
 use gtk::gdk;
-use gtk::prelude::*;
 use gtk4 as gtk;
+// sourceview5's prelude re-exports gtk4's, which covers gtk trait methods here.
 use rsclip_core::colors::parse_color;
 use rsclip_core::files::{URI_LIST_PREVIEW_MAX_FILES, parse_uri_list_bounded};
 use rsclip_core::format::masked_secret;
 use rsclip_core::models::{ClipboardEntry, EntryData, SecretEntry};
+use rsclip_core::syntax::CodeLanguage;
+use sourceview5::prelude::*;
 
 use crate::components::details::{render_details, render_secret_details};
 use crate::components::labels::{muted_label, section_label};
@@ -15,6 +17,11 @@ use crate::state::AppState;
 /// UI-side safety net for previews. Capped at 64 KiB so large text entries
 /// layout smoothly in `TextView` without blocking the GTK main thread.
 pub(crate) const MAX_FULL_PREVIEW_BYTES: usize = 64 * 1024;
+/// Payloads larger than this render as plain monospace (no syntax coloring).
+/// gtksourceview's context parse costs roughly 1 ms per KiB, so a 64 KiB code
+/// row cost ~57 ms per keypress; content beyond the bound is still shown and
+/// copy always delivers the full text.
+pub(crate) const MAX_HIGHLIGHT_BYTES: usize = 8 * 1024;
 pub(crate) const FULL_PREVIEW_TRUNCATED_NOTICE: &str =
     "\n\n[Preview truncated — copy the entry for full content]";
 pub(crate) const BINARY_PREVIEW_NOTICE: &str = "[Binary data — copy the entry for full content]";
@@ -23,6 +30,7 @@ pub(crate) struct PreviewPanel {
     pub(crate) shell: gtk::Box,
     pub(crate) preview: gtk::Box,
     pub(crate) details: gtk::Box,
+    pub(crate) channels: crate::state::PreviewChannels,
 }
 
 pub(crate) fn build_panel() -> PreviewPanel {
@@ -46,10 +54,48 @@ pub(crate) fn build_panel() -> PreviewPanel {
     details.set_hexpand(true);
     shell.append(&details);
 
+    // Plain-text preview channel: one TextView whose buffer is re-filled per
+    // selection instead of a fresh TextView per selection.
+    let text_buffer = gtk::TextBuffer::new(None);
+    let text_view = gtk::TextView::with_buffer(&text_buffer);
+    text_view.add_css_class("preview-text");
+    text_view.set_editable(false);
+    text_view.set_cursor_visible(false);
+    text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+    text_view.set_monospace(true);
+    text_view.set_vexpand(true);
+    text_view.set_left_margin(8);
+    text_view.set_right_margin(8);
+    let text_scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(80)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .propagate_natural_height(false)
+        .child(&text_view)
+        .build();
+
+    // Code preview channel: persistent sourceview View/Buffer pair. Reuse
+    // keeps the highlighting engine's per-buffer analysis cache warm.
+    let code_buffer = crate::highlight::setup_source_buffer("", CodeLanguage::Rust);
+    let code_view = crate::highlight::create_source_view(&code_buffer);
+    let code_scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(80)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .propagate_natural_height(false)
+        .child(&code_view)
+        .build();
+
     PreviewPanel {
         shell,
         preview,
         details,
+        channels: crate::state::PreviewChannels {
+            text: text_scroller,
+            text_buffer,
+            code: code_scroller,
+            code_buffer,
+        },
     }
 }
 
@@ -65,24 +111,11 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
     state.ocr_button.set_opacity(0.0);
     state.ocr_button.set_sensitive(false);
 
-    let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&masked_secret(&secret.value));
-    let view = gtk::TextView::with_buffer(&buffer);
-    view.add_css_class("preview-text");
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_wrap_mode(gtk::WrapMode::WordChar);
-    view.set_monospace(true);
-    view.set_vexpand(true);
-
-    let scroller = gtk::ScrolledWindow::builder()
-        .min_content_height(80)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .propagate_natural_height(false)
-        .child(&view)
-        .build();
-    state.preview.append(&scroller);
+    state
+        .channels
+        .text_buffer
+        .set_text(&masked_secret(&secret.value));
+    state.preview.append(&state.channels.text);
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
@@ -102,7 +135,7 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
 
     let reveal_button = gtk::Button::with_label("Reveal");
     {
-        let buffer = buffer.clone();
+        let buffer = state.channels.text_buffer.clone();
         let value = secret.value.clone();
         let masked = masked_secret(&secret.value);
         reveal_button.connect_clicked(move |button| {
@@ -157,6 +190,9 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     state.currently_previewed_entry_id.set(Some(entry.id));
     state.currently_previewed_secret_id.set(None);
 
+    let generation = state.preview_generation.get().wrapping_add(1);
+    state.preview_generation.set(generation);
+
     rsclip_core::profiler::begin_phase("render_preview");
     crate::components::clear_box(&state.preview);
     crate::components::clear_box(&state.details);
@@ -167,20 +203,28 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         .set_opacity(if can_ocr { 1.0 } else { 0.0 });
     state.ocr_button.set_sensitive(can_ocr);
 
-    // Summary rows omit text payloads; re-read the selected entry so text and
-    // OCR previews show the complete content instead of a stored snippet.
-    let full = match &entry.data {
+    // Summary rows omit text payloads; small ones re-read inline (sub-
+    // millisecond). A summary whose payload exceeds the preview cap would
+    // block the keypress with a multi-millisecond read of a huge row: render
+    // the snippet now and let the deferred upgrade do the single full read.
+    let (full, defer_full_read) = match &entry.data {
         EntryData::Text | EntryData::Unknown | EntryData::File { .. } => {
-            full_entry_for_preview(state, entry)
+            let huge_summary =
+                entry.text_content.is_none() && entry.size_bytes > MAX_FULL_PREVIEW_BYTES as i64;
+            if huge_summary {
+                (entry.clone(), true)
+            } else {
+                (full_entry_for_preview(state, entry), false)
+            }
         }
-        _ => entry.clone(),
+        _ => (entry.clone(), false),
     };
 
     match &full.data {
         EntryData::Image { .. } => render_image_preview(&state.preview, &full),
-        EntryData::Color { value, .. } => render_color_preview(&state.preview, value),
+        EntryData::Color { value, .. } => render_color_preview(state, value),
         EntryData::Link { url, .. } => {
-            render_text_preview(&state.preview, Some(url));
+            render_text_preview_state(state, Some(url));
         }
         EntryData::File { .. } => render_file_preview(state, &full),
         EntryData::Text | EntryData::Unknown => {
@@ -189,9 +233,9 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
                 .as_deref()
                 .or(full.preview_text.as_deref());
             if content.is_none() && matches!(full.data, EntryData::Unknown) {
-                render_text_preview(&state.preview, Some(BINARY_PREVIEW_NOTICE));
+                render_text_preview_state(state, Some(BINARY_PREVIEW_NOTICE));
             } else {
-                render_text_or_code_preview(&state.preview, content);
+                render_text_or_code_preview(state, content);
             }
         }
     }
@@ -203,7 +247,11 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         && !ocr.is_empty()
     {
         render_ocr_header(state, ocr);
-        render_text_preview(&state.preview, Some(ocr));
+        render_text_preview_state(state, Some(ocr));
+    }
+
+    if defer_full_read {
+        schedule_preview_upgrade(state, full.clone(), generation);
     }
 
     render_details(&state.details, &full);
@@ -263,7 +311,7 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     let bounded =
         parse_uri_list_bounded(payload, URI_LIST_PREVIEW_MAX_FILES, MAX_FULL_PREVIEW_BYTES);
     if bounded.files.is_empty() {
-        render_text_preview(&state.preview, Some(payload));
+        render_text_preview_state(state, Some(payload));
         rsclip_core::profiler::end_phase("render_file_preview");
         return;
     }
@@ -316,7 +364,7 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         ));
     }
 
-    render_text_preview(&state.preview, Some(&paths));
+    render_text_preview_state(state, Some(&paths));
     rsclip_core::profiler::end_phase("render_file_preview");
 }
 
@@ -328,7 +376,7 @@ fn file_count_label(count: usize) -> String {
     }
 }
 
-fn render_color_preview(container: &gtk::Box, hex: &str) {
+fn render_color_preview(state: &Rc<AppState>, hex: &str) {
     let frame = gtk::AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
     frame.set_hexpand(true);
     frame.set_vexpand(true);
@@ -347,13 +395,16 @@ fn render_color_preview(container: &gtk::Box, hex: &str) {
         })
         .unwrap_or((0.2, 0.2, 0.2));
     swatch.set_draw_func(move |_, cr, width, height| {
+        if width <= 0 || height <= 0 {
+            return;
+        }
         cr.set_source_rgb(color.0, color.1, color.2);
         cr.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
         let _ = cr.fill();
     });
     frame.set_child(Some(&swatch));
-    container.append(&frame);
-    render_text_preview(container, Some(hex));
+    state.preview.append(&frame);
+    render_text_preview_state(state, Some(hex));
 }
 
 fn render_ocr_header(state: &Rc<AppState>, ocr: &str) {
@@ -390,9 +441,12 @@ fn full_entry_for_preview(state: &Rc<AppState>, entry: &ClipboardEntry) -> Clipb
     }
 
     rsclip_core::profiler::begin_phase("query_full_entry");
+    // The preview pane truncates at MAX_FULL_PREVIEW_BYTES anyway; cap the SQL
+    // read to match so a legacy multi-megabyte payload cannot stall the GTK
+    // thread. Copying still uses the full row via Database::get_entry.
     let result = state
         .db
-        .get_entry(entry.id)
+        .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES)
         .ok()
         .flatten()
         .unwrap_or_else(|| entry.clone());
@@ -404,69 +458,98 @@ fn is_binary_payload(text: &str) -> bool {
     text.as_bytes().contains(&0)
 }
 
-fn render_text_or_code_preview(container: &gtk::Box, text: Option<&str>) {
-    let raw = text.unwrap_or("");
-    if let Some(lang) = rsclip_core::syntax::detect_code_language(raw) {
-        render_code_preview(container, raw, lang);
+fn sanitize_preview_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let preview = bounded_full_preview(text);
+    if preview.contains('\0') {
+        std::borrow::Cow::Owned(preview.replace('\0', " "))
     } else {
-        render_text_preview(container, text);
+        preview
     }
 }
 
-fn render_code_preview(container: &gtk::Box, text: &str, lang: rsclip_core::syntax::CodeLanguage) {
-    rsclip_core::profiler::begin_phase("render_code_preview");
-    let preview_text = bounded_full_preview(text);
-    let sanitized = if preview_text.contains('\0') {
-        std::borrow::Cow::Owned(preview_text.replace('\0', " "))
+/// Upgrade a just-rendered summary preview to its full content after the fact.
+///
+/// Rows whose payload exceeds the preview cap would block the keypress with a
+/// multi-millisecond SQLite read; instead the keypress renders the snippet and
+/// this idle performs the single capped read, re-rendering full content. The
+/// upgrade aborts when the selection moved before it runs, so a slow read can
+/// never land on a stale selection.
+fn schedule_preview_upgrade(state: &Rc<AppState>, entry: ClipboardEntry, generation: u64) {
+    let state = Rc::clone(state);
+    gtk::glib::idle_add_local_once(move || {
+        let current = state.currently_previewed_entry_id.get();
+        if current != Some(entry.id) || generation != state.preview_generation.get() {
+            return;
+        }
+        let Some(full) = state
+            .db
+            .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        match &full.data {
+            EntryData::Text | EntryData::Unknown => {
+                let content = full
+                    .text_content
+                    .as_deref()
+                    .or(full.preview_text.as_deref());
+                if let Some(content) = content {
+                    if let Some(lang) = rsclip_core::syntax::detect_code_language(content) {
+                        render_code_preview(&state, content, lang);
+                    } else {
+                        render_text_preview_state(&state, Some(content));
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+}
+
+fn render_text_or_code_preview(state: &Rc<AppState>, text: Option<&str>) {
+    let raw = text.unwrap_or("");
+    if let Some(lang) = rsclip_core::syntax::detect_code_language(raw) {
+        render_code_preview(state, raw, lang);
     } else {
-        preview_text
-    };
+        render_text_preview_state(state, text);
+    }
+}
 
-    let buffer = crate::highlight::setup_source_buffer(&sanitized, lang);
-    let view = crate::highlight::create_source_view(&buffer);
+fn render_code_preview(state: &Rc<AppState>, text: &str, lang: rsclip_core::syntax::CodeLanguage) {
+    rsclip_core::profiler::begin_phase("render_code_preview");
+    let sanitized = sanitize_preview_text(text);
 
-    let scroller = gtk::ScrolledWindow::builder()
-        .min_content_height(80)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .propagate_natural_height(false)
-        .child(&view)
-        .build();
+    let buffer = &state.channels.code_buffer;
+    // Bound the highlight work: only payloads within the bound get the
+    // context-engine parse; larger ones stay plain monospace, so their
+    // language definition is never loaded at all.
+    let highlight = sanitized.len() <= MAX_HIGHLIGHT_BYTES;
+    // Freeze highlighting during the swap so the re-highlight of a newly set
+    // language runs as one batch after the text is in place.
+    buffer.set_highlight_syntax(false);
+    if highlight && let Some(language) = crate::highlight::cached_language_for(lang) {
+        buffer.set_language(Some(&language));
+    }
+    buffer.set_text(&sanitized);
+    buffer.set_highlight_syntax(highlight);
 
-    container.append(&scroller);
+    state.preview.append(&state.channels.code);
     rsclip_core::profiler::end_phase("render_code_preview");
 }
 
-fn render_text_preview(container: &gtk::Box, text: Option<&str>) {
+fn render_text_preview_state(state: &Rc<AppState>, text: Option<&str>) {
     rsclip_core::profiler::begin_phase("render_text_preview");
-    let preview_text = bounded_full_preview(text.unwrap_or(""));
-    let sanitized = if preview_text.contains('\0') {
-        std::borrow::Cow::Owned(preview_text.replace('\0', " "))
-    } else {
-        preview_text
-    };
-    let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&sanitized);
-    let view = gtk::TextView::with_buffer(&buffer);
-    view.add_css_class("preview-text");
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_wrap_mode(gtk::WrapMode::WordChar);
-    view.set_monospace(true);
-    view.set_vexpand(true);
-
-    // Fill the preview pane and scroll long content internally so the whole
-    // entry stays reachable without truncating the buffer.
-    let scroller = gtk::ScrolledWindow::builder()
-        .min_content_height(80)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .propagate_natural_height(false)
-        .child(&view)
-        .build();
-
-    container.append(&scroller);
+    fill_text_preview(state, text);
+    state.preview.append(&state.channels.text);
     rsclip_core::profiler::end_phase("render_text_preview");
+}
+
+/// Fill the persistent plain-text buffer with the bounded preview payload.
+fn fill_text_preview(state: &Rc<AppState>, text: Option<&str>) {
+    let sanitized = sanitize_preview_text(text.unwrap_or(""));
+    state.channels.text_buffer.set_text(&sanitized);
 }
 
 /// Cap preview text without splitting a UTF-8 code point, and detect binary payloads.

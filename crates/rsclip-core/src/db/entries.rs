@@ -301,6 +301,35 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Load one entry for preview rendering, with the text payload capped to
+    /// [`PREVIEW_TEXT_LIMIT_BYTES`].
+    ///
+    /// The preview pane truncates at 64 KiB anyway; reading a legacy 40 MB row
+    /// in full would copy tens of megabytes on the GTK thread per keypress.
+    /// [`Database::get_entry`] still returns the complete payload for copying.
+    pub fn get_entry_preview(&self, id: i64, limit: usize) -> Result<Option<ClipboardEntry>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                  e.id, e.content_hash, e.kind, e.mime_type, e.title, e.preview_text,
+                  CASE WHEN e.kind = 'text' THEN substr(e.text_content, 1, ?2)
+                       ELSE e.text_content END AS text_content,
+                  e.file_path, e.thumb_path, e.source_app, e.link_url,
+                  e.link_domain, e.link_icon, e.color_value, e.color_format, e.pinned,
+                  e.copied_at, e.updated_at, e.last_used_at, e.use_count, e.size_bytes,
+                  o.text AS ocr_text
+                FROM entries e
+                LEFT JOIN ocr_results o ON o.entry_id = e.id
+                WHERE e.id = ?1 AND e.deleted = 0
+                "#,
+                params![id, limit as i64],
+                entry_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Toggles the pinned flag for an entry.
     pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<()> {
         self.conn.execute(

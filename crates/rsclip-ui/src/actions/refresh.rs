@@ -70,8 +70,9 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
     let desired_start = first_visible.saturating_sub(WINDOW_PADDING_ROWS);
 
     let needs_reload = current_len == 0
-        || first_visible < current_start
-        || first_visible.saturating_add(visible_rows) > current_start.saturating_add(current_len)
+        || (first_visible < current_start && current_start > 0)
+        || (first_visible.saturating_add(visible_rows) > current_start.saturating_add(current_len)
+            && current_start.saturating_add(current_len) < total)
         || desired_start.abs_diff(current_start) >= WINDOW_PADDING_ROWS / 2;
 
     if !needs_reload {
@@ -80,6 +81,12 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
 
     let window_len = window_row_count(state, total);
     let normalized_start = normalized_window_start(desired_start, total, window_len);
+    if normalized_start == current_start
+        && current_len >= window_len.min(total.saturating_sub(current_start))
+    {
+        return Ok(());
+    }
+
     let normalized_end = normalized_start.saturating_add(window_len);
     let selected_index = selected_index(state)
         .filter(|index| *index >= normalized_start && *index < normalized_end)
@@ -132,7 +139,6 @@ fn queue_window(
             query,
             filter,
             sort,
-            history_limit: state.history_limit.get(),
             row_limit: search_window_row_count(state),
             requested_start,
             selected_index,
@@ -399,7 +405,8 @@ fn restore_scroll_position(
         + f64::from(spacer_height(
             total.saturating_sub(start.saturating_add(len)),
         ));
-    let max_value = (content_height - page_size).max(0.0);
+    let max_upper = state.list_adjustment.upper().max(content_height);
+    let max_value = (max_upper - page_size).max(0.0);
 
     let Some(index) = selected_index else {
         state
@@ -414,12 +421,14 @@ fn restore_scroll_position(
     let viewport_top = scroll_value;
     let viewport_bottom = scroll_value + page_size;
 
-    let value = if row_top >= viewport_top && row_bottom <= viewport_bottom {
-        scroll_value
+    let value = if row_top < viewport_top {
+        row_top
+    } else if row_bottom > viewport_bottom {
+        (row_bottom - page_size).max(0.0)
     } else {
-        (row_top - page_size * 0.25).max(0.0)
+        scroll_value
     };
-    state.list_adjustment.set_value(value.min(max_value));
+    state.list_adjustment.set_value(value.clamp(0.0, max_value));
 }
 
 fn visible_first_index(state: &Rc<AppState>) -> usize {
