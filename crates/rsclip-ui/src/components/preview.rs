@@ -496,6 +496,13 @@ fn schedule_preview_upgrade(state: &Rc<AppState>, entry: ClipboardEntry, generat
                     .as_deref()
                     .or(full.preview_text.as_deref());
                 if let Some(content) = content {
+                    for channel in [&state.channels.text, &state.channels.code] {
+                        if channel.parent().as_ref()
+                            == Some(state.preview.upcast_ref::<gtk::Widget>())
+                        {
+                            state.preview.remove(channel);
+                        }
+                    }
                     if let Some(lang) = rsclip_core::syntax::detect_code_language(content) {
                         render_code_preview(&state, content, lang);
                     } else {
