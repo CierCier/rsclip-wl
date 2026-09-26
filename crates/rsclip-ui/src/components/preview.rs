@@ -188,7 +188,9 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         return;
     }
     state.currently_previewed_entry_id.set(Some(entry.id));
-    state.currently_previewed_secret_id.set(None);
+    if state.currently_previewed_secret_id.take().is_some() {
+        state.channels.text_buffer.set_text("");
+    }
 
     let generation = state.preview_generation.get().wrapping_add(1);
     state.preview_generation.set(generation);
@@ -266,6 +268,8 @@ pub(crate) fn clear_preview_state(state: &Rc<AppState>) {
     crate::state::invalidate_preview_cache(state);
     crate::components::clear_box(&state.preview);
     crate::components::clear_box(&state.details);
+    state.channels.text_buffer.set_text("");
+    state.channels.code_buffer.set_text("");
     state.ocr_button.set_opacity(0.0);
     state.ocr_button.set_sensitive(false);
 }
@@ -518,8 +522,10 @@ fn schedule_preview_upgrade(state: &Rc<AppState>, entry: ClipboardEntry, generat
 fn render_text_or_code_preview(state: &Rc<AppState>, text: Option<&str>) {
     let raw = text.unwrap_or("");
     if let Some(lang) = rsclip_core::syntax::detect_code_language(raw) {
+        state.channels.text_buffer.set_text("");
         render_code_preview(state, raw, lang);
     } else {
+        state.channels.code_buffer.set_text("");
         render_text_preview_state(state, text);
     }
 }

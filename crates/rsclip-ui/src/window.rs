@@ -248,6 +248,9 @@ pub(crate) fn hide_overlay(state: &Rc<AppState>, window: &gtk::ApplicationWindow
     window.set_keyboard_mode(KeyboardMode::None);
     window.set_visible(false);
     *state.prompt_active.borrow_mut() = false;
+    if state.currently_previewed_secret_id.take().is_some() {
+        state.channels.text_buffer.set_text("");
+    }
 }
 
 pub(crate) fn close_overlay_and_paste(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
