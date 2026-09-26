@@ -115,6 +115,7 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
         .channels
         .text_buffer
         .set_text(&masked_secret(&secret.value));
+    state.channels.text.vadjustment().set_value(0.0);
     state.preview.append(&state.channels.text);
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -450,7 +451,7 @@ fn full_entry_for_preview(state: &Rc<AppState>, entry: &ClipboardEntry) -> Clipb
     // thread. Copying still uses the full row via Database::get_entry.
     let result = state
         .db
-        .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES)
+        .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
         .ok()
         .flatten()
         .unwrap_or_else(|| entry.clone());
@@ -487,7 +488,7 @@ fn schedule_preview_upgrade(state: &Rc<AppState>, entry: ClipboardEntry, generat
         }
         let Some(full) = state
             .db
-            .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES)
+            .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
             .ok()
             .flatten()
         else {
@@ -548,6 +549,8 @@ fn render_code_preview(state: &Rc<AppState>, text: &str, lang: rsclip_core::synt
     buffer.set_text(&sanitized);
     buffer.set_highlight_syntax(highlight);
 
+    state.channels.code.vadjustment().set_value(0.0);
+    state.channels.code.hadjustment().set_value(0.0);
     state.preview.append(&state.channels.code);
     rsclip_core::profiler::end_phase("render_code_preview");
 }
@@ -555,6 +558,7 @@ fn render_code_preview(state: &Rc<AppState>, text: &str, lang: rsclip_core::synt
 fn render_text_preview_state(state: &Rc<AppState>, text: Option<&str>) {
     rsclip_core::profiler::begin_phase("render_text_preview");
     fill_text_preview(state, text);
+    state.channels.text.vadjustment().set_value(0.0);
     state.preview.append(&state.channels.text);
     rsclip_core::profiler::end_phase("render_text_preview");
 }
