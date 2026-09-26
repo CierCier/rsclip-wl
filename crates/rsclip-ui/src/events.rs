@@ -19,12 +19,13 @@ use crate::actions::refresh::{
 use crate::actions::secrets::{
     delete_current, rename_current_secret_dialog, save_current_as_secret_dialog, toggle_pin,
 };
-use crate::actions::selection::{mark_selected_row, move_selection};
+use crate::actions::selection::{
+    mark_selected_row, move_selection, schedule_preview_for_current_selection,
+};
 use crate::actions::{set_footer, update_mode_controls};
-use crate::components::preview::{render_preview, render_secret_preview};
 use crate::state::{
     AppState, AppView, ListRequest, ListResponse, ListResults, current_entry, current_full_entry,
-    current_secret, entry_at_row, full_entry_at_row, secret_at_row,
+    current_secret, full_entry_at_row, secret_at_row,
 };
 
 /// Delay before applying search so typing does not block the UI on every keystroke.
@@ -158,7 +159,6 @@ fn connect_search(state: &Rc<AppState>) {
                 query: state.query.borrow().clone(),
                 filter: *state.filter.borrow(),
                 sort: *state.sort.borrow(),
-                history_limit: state.history_limit.get(),
                 row_limit: search_window_row_count(&state),
                 requested_start: 0,
                 selected_index: 0,
@@ -251,9 +251,11 @@ fn list_worker(
 fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults> {
     Ok(match request.view {
         AppView::Clipboard => {
-            let total = db
-                .count_entries(&request.query, request.filter)?
-                .min(request.history_limit);
+            // The configured max_entries is a capture/dedup budget for the
+            // daemon, not a hard history bound — nothing prunes to it. Do not
+            // clamp the count here: the UI must show the real total and let
+            // the user navigate everything that exists.
+            let total = db.count_entries(&request.query, request.filter)?;
             let window_len = request.row_limit.min(total);
             let start = request
                 .requested_start
@@ -276,7 +278,7 @@ fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults
             }
         }
         AppView::Secrets => {
-            let total = db.count_secrets(&request.query)?.min(request.history_limit);
+            let total = db.count_secrets(&request.query)?;
             let window_len = request.row_limit.min(total);
             let start = request
                 .requested_start
@@ -353,23 +355,9 @@ fn connect_list_selection(state: &Rc<AppState>) {
         if state.virtual_list_update.get() {
             return;
         }
-        if let Some(row) = row {
-            let index = row.index();
-            if index >= 0 {
-                match *state.view.borrow() {
-                    AppView::Clipboard => {
-                        if let Some(entry) = entry_at_row(&state, row) {
-                            render_preview(&state, &entry);
-                        }
-                    }
-                    AppView::Secrets => {
-                        if let Some(secret) = secret_at_row(&state, row) {
-                            render_secret_preview(&state, &secret);
-                        }
-                    }
-                }
-            }
-        }
+        // Coalesce user-driven selection changes (key-repeat, mouse) so at most
+        // one preview rebuild happens per main-loop iteration.
+        schedule_preview_for_current_selection(&state);
     });
 }
 

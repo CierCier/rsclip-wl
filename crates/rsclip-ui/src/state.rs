@@ -21,7 +21,6 @@ pub(crate) struct ListRequest {
     pub(crate) query: String,
     pub(crate) filter: EntryFilter,
     pub(crate) sort: SortMode,
-    pub(crate) history_limit: usize,
     pub(crate) row_limit: usize,
     pub(crate) requested_start: usize,
     pub(crate) selected_index: usize,
@@ -48,6 +47,22 @@ pub(crate) struct ListResponse {
     pub(crate) result: Result<ListResults, String>,
 }
 
+/// Persistent preview widget channels. Content is re-filled per selection;
+/// the widget trees themselves are never torn down, so keypresses avoid
+/// widget-tree and Pango-layout rebuild costs.
+/// Bumped on every preview render (clipboard or secret). Deferred preview
+/// upgrades capture it and abort when it changes, so a slow upgrade can never
+/// land on a selection the user has already left.
+pub(crate) struct PreviewChannels {
+    /// Plain-text preview: one TextView whose buffer is re-filled per selection.
+    pub(crate) text: gtk::ScrolledWindow,
+    pub(crate) text_buffer: gtk::TextBuffer,
+    /// Syntax-highlighted preview: persistent sourceview View/Buffer pair so
+    /// the highlighting engine's per-buffer analysis cache stays warm.
+    pub(crate) code: gtk::ScrolledWindow,
+    pub(crate) code_buffer: sourceview5::Buffer,
+}
+
 pub(crate) struct AppState {
     /// Long-lived connection for writes and explicit full-entry reads.
     pub(crate) db: Database,
@@ -56,6 +71,8 @@ pub(crate) struct AppState {
     pub(crate) list_response_poll: RefCell<Option<gtk::glib::SourceId>>,
     pub(crate) list_generation: Cell<u64>,
     pub(crate) favicon_icon_dir: PathBuf,
+    /// Daemon capture budget (`[history] max_entries`). The daemon never
+    /// prunes to it, so the list does not clamp counts by this value.
     pub(crate) history_limit: Cell<usize>,
     pub(crate) auto_paste: Cell<bool>,
     pub(crate) paste_delay_ms: Cell<u64>,
@@ -95,6 +112,9 @@ pub(crate) struct AppState {
     pub(crate) preview_shell: gtk::Box,
     pub(crate) preview: gtk::Box,
     pub(crate) details: gtk::Box,
+    pub(crate) channels: PreviewChannels,
+    /// Increments on every preview render; deferred upgrades validate against it.
+    pub(crate) preview_generation: Cell<u64>,
     pub(crate) footer: gtk::Label,
     pub(crate) ocr_button: gtk::Button,
     pub(crate) currently_previewed_entry_id: Cell<Option<i64>>,

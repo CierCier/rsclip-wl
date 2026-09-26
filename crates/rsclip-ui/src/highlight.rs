@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use rsclip_core::syntax::CodeLanguage;
 use sourceview5::prelude::*;
-use sourceview5::{Buffer, LanguageManager, StyleSchemeManager, View};
+use sourceview5::{Buffer, Language, LanguageManager, StyleScheme, StyleSchemeManager, View};
 
 const RSCLIP_DARK_SCHEME_XML: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <style-scheme id="rsclip-dark" _name="rsclip Dark" version="1.0">
@@ -72,25 +75,61 @@ fn ensure_custom_scheme() {
     });
 }
 
+// LanguageManager::default() and StyleSchemeManager::default() rescan their
+// search paths on every call, and `lm.language(id)` re-resolves the language
+// definition. setup_source_buffer ran all of that per preview render — tens of
+// milliseconds during arrow-key navigation. The resolved singletons are frozen
+// for the process lifetime, so resolve them once per thread and reuse.
+thread_local! {
+    static LANGUAGE_CACHE: RefCell<Option<HashMap<CodeLanguage, Language>>> =
+        const { RefCell::new(None) };
+    static SCHEME_CACHE: RefCell<Option<Option<StyleScheme>>> = const { RefCell::new(None) };
+}
+
+/// Cached sourceview language for `lang`, resolving on first use.
+pub(crate) fn cached_language_for(lang: CodeLanguage) -> Option<Language> {
+    LANGUAGE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if let Some(language) = cache.get(&lang) {
+            return Some(language.clone());
+        }
+        let language = LanguageManager::default().language(lang.sourceview_id());
+        if let Some(language) = &language {
+            cache.insert(lang, language.clone());
+        }
+        language
+    })
+}
+
+fn cached_scheme() -> Option<StyleScheme> {
+    SCHEME_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(scheme) = cache.as_ref().and_then(Option::as_ref) {
+            return Some(scheme.clone());
+        }
+        ensure_custom_scheme();
+        let sm = StyleSchemeManager::default();
+        let scheme = sm
+            .scheme("rsclip-dark")
+            .or_else(|| sm.scheme("Adwaita-dark"))
+            .or_else(|| sm.scheme("classic-dark"));
+        *cache = Some(scheme.clone());
+        scheme
+    })
+}
+
 /// Sets up a `sourceview5::Buffer` with syntax highlighting and transparent dark style scheme for `lang`.
 pub fn setup_source_buffer(code: &str, lang: CodeLanguage) -> Buffer {
-    ensure_custom_scheme();
-
     let buffer = Buffer::new(None);
     buffer.set_text(code);
 
-    let lm = LanguageManager::default();
-    if let Some(language) = lm.language(lang.sourceview_id()) {
+    if let Some(language) = cached_language_for(lang) {
         buffer.set_language(Some(&language));
     }
     buffer.set_highlight_syntax(true);
 
-    let sm = StyleSchemeManager::default();
-    let scheme = sm
-        .scheme("rsclip-dark")
-        .or_else(|| sm.scheme("Adwaita-dark"))
-        .or_else(|| sm.scheme("classic-dark"));
-    if let Some(scheme) = scheme {
+    if let Some(scheme) = cached_scheme() {
         buffer.set_style_scheme(Some(&scheme));
     }
 
