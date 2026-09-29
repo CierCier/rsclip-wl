@@ -160,82 +160,83 @@ pub fn create_source_view(buffer: &Buffer) -> View {
 mod tests {
     use super::*;
 
+    /// GTK may only be initialized from one thread, and cargo runs each test
+    /// on its own thread, so all GTK-backed checks share this single test.
+    /// Without a display (CI), `gtk4::init` fails and the checks are skipped.
     #[test]
-    fn sourceview_finds_all_languages() {
+    fn sourceview_languages_scheme_and_buffer() {
         if gtk4::init().is_err() {
             return;
         }
-        let lm = LanguageManager::default();
-        let languages = [
-            CodeLanguage::Rust,
-            CodeLanguage::Python,
-            CodeLanguage::JavaScript,
-            CodeLanguage::TypeScript,
-            CodeLanguage::Go,
-            CodeLanguage::C,
-            CodeLanguage::Cpp,
-            CodeLanguage::CSharp,
-            CodeLanguage::Java,
-            CodeLanguage::Html,
-            CodeLanguage::Css,
-            CodeLanguage::Json,
-            CodeLanguage::Yaml,
-            CodeLanguage::Toml,
-            CodeLanguage::Sql,
-            CodeLanguage::Shell,
-            CodeLanguage::Markdown,
-            CodeLanguage::Php,
-            CodeLanguage::Ruby,
-            CodeLanguage::Lua,
-            CodeLanguage::Xml,
-            CodeLanguage::Diff,
-            CodeLanguage::Docker,
-        ];
 
-        for lang in languages {
-            let id = lang.sourceview_id();
-            let source_lang = lm.language(id);
+        // Every CodeLanguage maps to a GtkSourceView language.
+        {
+            let lm = LanguageManager::default();
+            let languages = [
+                CodeLanguage::Rust,
+                CodeLanguage::Python,
+                CodeLanguage::JavaScript,
+                CodeLanguage::TypeScript,
+                CodeLanguage::Go,
+                CodeLanguage::C,
+                CodeLanguage::Cpp,
+                CodeLanguage::CSharp,
+                CodeLanguage::Java,
+                CodeLanguage::Html,
+                CodeLanguage::Css,
+                CodeLanguage::Json,
+                CodeLanguage::Yaml,
+                CodeLanguage::Toml,
+                CodeLanguage::Sql,
+                CodeLanguage::Shell,
+                CodeLanguage::Markdown,
+                CodeLanguage::Php,
+                CodeLanguage::Ruby,
+                CodeLanguage::Lua,
+                CodeLanguage::Xml,
+                CodeLanguage::Diff,
+                CodeLanguage::Docker,
+            ];
+
+            for lang in languages {
+                let id = lang.sourceview_id();
+                let source_lang = lm.language(id);
+                assert!(
+                    source_lang.is_some(),
+                    "GtkSourceView failed to find language for {:?} (id: {})",
+                    lang,
+                    id
+                );
+            }
+        }
+
+        // The custom scheme exists and keeps line numbers transparent.
+        {
+            ensure_custom_scheme();
+            let sm = StyleSchemeManager::default();
+            let scheme = sm.scheme("rsclip-dark");
             assert!(
-                source_lang.is_some(),
-                "GtkSourceView failed to find language for {:?} (id: {})",
-                lang,
-                id
+                scheme.is_some(),
+                "Expected rsclip-dark style scheme to exist"
             );
+            let scheme = scheme.unwrap();
+            let ln = scheme.style("line-numbers");
+            if let Some(ln) = ln {
+                assert!(
+                    !ln.is_background_set(),
+                    "Line numbers background must not be set (transparent)"
+                );
+            }
         }
-    }
 
-    #[test]
-    fn transparent_style_scheme_exists() {
-        if gtk4::init().is_err() {
-            return;
+        // Buffers keep their text and enable highlighting.
+        {
+            let code = "def foo():\n    return 42\n";
+            let buffer = setup_source_buffer(code, CodeLanguage::Python);
+            let start = buffer.start_iter();
+            let end = buffer.end_iter();
+            assert_eq!(buffer.text(&start, &end, false), code);
+            assert!(buffer.is_highlight_syntax());
         }
-        ensure_custom_scheme();
-        let sm = StyleSchemeManager::default();
-        let scheme = sm.scheme("rsclip-dark");
-        assert!(
-            scheme.is_some(),
-            "Expected rsclip-dark style scheme to exist"
-        );
-        let scheme = scheme.unwrap();
-        let ln = scheme.style("line-numbers");
-        if let Some(ln) = ln {
-            assert!(
-                !ln.is_background_set(),
-                "Line numbers background must not be set (transparent)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_setup_source_buffer() {
-        if gtk4::init().is_err() {
-            return;
-        }
-        let code = "def foo():\n    return 42\n";
-        let buffer = setup_source_buffer(code, CodeLanguage::Python);
-        let start = buffer.start_iter();
-        let end = buffer.end_iter();
-        assert_eq!(buffer.text(&start, &end, false), code);
-        assert!(buffer.is_highlight_syntax());
     }
 }
