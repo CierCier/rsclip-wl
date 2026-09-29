@@ -165,6 +165,18 @@ fn queue_window(
     )
 }
 
+pub(crate) fn resolve_window_selection(
+    live_selection: Option<usize>,
+    request_selection: usize,
+    window_start: usize,
+    window_len: usize,
+) -> Option<usize> {
+    let window_end = window_start.saturating_add(window_len);
+    live_selection
+        .filter(|idx| *idx >= window_start && *idx < window_end)
+        .or(Some(request_selection))
+}
+
 /// Replace the visible clipboard window with a completed worker result.
 pub(crate) fn apply_clipboard_search_results(
     state: &Rc<AppState>,
@@ -173,13 +185,19 @@ pub(crate) fn apply_clipboard_search_results(
     start: usize,
     entries: Vec<ClipboardEntry>,
 ) {
+    let live_selection = state.pending_selection.take().or_else(|| current_entry_index(state));
     state.secrets.borrow_mut().clear();
     state.secrets_start.set(0);
     state.secrets_total.set(0);
     *state.entries.borrow_mut() = entries;
     state.entries_start.set(start);
     state.entries_total.set(total);
-    let selected_index = state.pending_selection.take().or(Some(request.selected_index));
+    let selected_index = resolve_window_selection(
+        live_selection,
+        request.selected_index,
+        start,
+        state.entries.borrow().len(),
+    );
     render_clipboard_window(state, selected_index, request.preserve_scroll);
 }
 
@@ -191,13 +209,19 @@ pub(crate) fn apply_secret_search_results(
     start: usize,
     secrets: Vec<SecretEntry>,
 ) {
+    let live_selection = state.pending_selection.take().or_else(|| current_secret_index(state));
     state.entries.borrow_mut().clear();
     state.entries_start.set(0);
     state.entries_total.set(0);
     *state.secrets.borrow_mut() = secrets;
     state.secrets_start.set(start);
     state.secrets_total.set(total);
-    let selected_index = state.pending_selection.take().or(Some(request.selected_index));
+    let selected_index = resolve_window_selection(
+        live_selection,
+        request.selected_index,
+        start,
+        state.secrets.borrow().len(),
+    );
     render_secrets_window(state, selected_index, request.preserve_scroll);
 }
 
@@ -470,9 +494,9 @@ fn window_row_count(state: &Rc<AppState>, total: usize) -> usize {
     window_row_count_for(visible_row_count(state), total)
 }
 
-/// Calculate the number of rows requested by the background list worker.
+/// Calculate the number of rows requested by the background list worker during search.
 pub(crate) fn search_window_row_count(state: &Rc<AppState>) -> usize {
-    window_row_count_for(visible_row_count(state), usize::MAX)
+    visible_row_count(state).saturating_add(20)
 }
 
 fn window_row_count_for(visible_rows: usize, total: usize) -> usize {
@@ -549,7 +573,32 @@ fn update_secret_footer(state: &Rc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_window_index, normalized_window_start, window_row_count_for};
+    use super::{
+        clamp_window_index, normalized_window_start, resolve_window_selection,
+        window_row_count_for,
+    };
+
+    #[test]
+    fn window_selection_preserves_live_selection_within_window() {
+        // User was at row 36 when async reload was dispatched.
+        // During reload fetch, user arrowed down to row 38.
+        // The newly rendered window covers rows 0..100.
+        // Live selection 38 must be preserved instead of reverting to 36.
+        assert_eq!(
+            resolve_window_selection(Some(38), 36, 0, 100),
+            Some(38)
+        );
+        // If live selection fell outside the window bounds, fall back to request_selection.
+        assert_eq!(
+            resolve_window_selection(Some(150), 36, 0, 100),
+            Some(36)
+        );
+        // If there was no live selection, fall back to request_selection.
+        assert_eq!(
+            resolve_window_selection(None, 36, 0, 100),
+            Some(36)
+        );
+    }
 
     #[test]
     fn result_window_is_bounded_for_large_history() {

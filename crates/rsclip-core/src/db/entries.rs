@@ -211,24 +211,7 @@ impl Database {
     /// Returns the count of active entries matching the query and filter.
     pub fn count_entries(&self, query: &str, filter: EntryFilter) -> Result<usize> {
         let has_query = !query.trim().is_empty();
-        let mut sql = if has_query {
-            String::from(
-                r#"
-                SELECT COUNT(*)
-                FROM entries e
-                LEFT JOIN ocr_results o ON o.entry_id = e.id
-                WHERE e.deleted = 0
-                "#,
-            )
-        } else {
-            String::from(
-                r#"
-                SELECT COUNT(*)
-                FROM entries e
-                WHERE e.deleted = 0
-                "#,
-            )
-        };
+        let mut sql = String::from("SELECT COUNT(*) FROM entries e WHERE e.deleted = 0");
 
         append_entry_filter(&mut sql, filter);
         if has_query {
@@ -448,9 +431,11 @@ fn append_entry_search(sql: &mut String) {
     sql.push_str(
         r#"
         AND (
-          e.title LIKE ?1 OR e.preview_text LIKE ?1 OR substr(e.text_content, 1, 65536) LIKE ?1
-          OR e.link_url LIKE ?1 OR e.link_domain LIKE ?1 OR e.color_value LIKE ?1
-          OR o.text LIKE ?1
+          e.title LIKE ?1 OR e.preview_text LIKE ?1
+          OR (e.kind = 'text' AND substr(e.text_content, 1, 16384) LIKE ?1)
+          OR (e.kind = 'link' AND (e.link_url LIKE ?1 OR e.link_domain LIKE ?1))
+          OR (e.kind = 'color' AND e.color_value LIKE ?1)
+          OR (e.kind = 'image' AND EXISTS (SELECT 1 FROM ocr_results o WHERE o.entry_id = e.id AND o.text LIKE ?1))
         )
         "#,
     );

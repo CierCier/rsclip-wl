@@ -29,7 +29,7 @@ use crate::state::{
 };
 
 /// Delay before applying search so typing does not block the UI on every keystroke.
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(160);
 const LIST_RESULT_POLL: Duration = Duration::from_millis(16);
 
 pub(crate) fn start_list_worker(
@@ -251,28 +251,24 @@ fn list_worker(
 fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults> {
     Ok(match request.view {
         AppView::Clipboard => {
-            // The configured max_entries is a capture/dedup budget for the
-            // daemon, not a hard history bound — nothing prunes to it. Do not
-            // clamp the count here: the UI must show the real total and let
-            // the user navigate everything that exists.
+            let start = request.requested_start;
+            let window_len = request.row_limit;
+            let entries = db.list_entry_summaries_page(
+                &request.query,
+                request.filter,
+                request.sort,
+                window_len,
+                start,
+            )?;
             let total = match request.known_total {
                 Some(total) => total,
-                None => db.count_entries(&request.query, request.filter)?,
-            };
-            let window_len = request.row_limit.min(total);
-            let start = request
-                .requested_start
-                .min(total.saturating_sub(window_len));
-            let entries = if total == 0 || window_len == 0 {
-                Vec::new()
-            } else {
-                db.list_entry_summaries_page(
-                    &request.query,
-                    request.filter,
-                    request.sort,
-                    window_len,
-                    start,
-                )?
+                None => {
+                    if start == 0 && entries.len() < window_len {
+                        entries.len()
+                    } else {
+                        db.count_entries(&request.query, request.filter)?
+                    }
+                }
             };
             ListResults::Clipboard {
                 total,
@@ -281,18 +277,18 @@ fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults
             }
         }
         AppView::Secrets => {
+            let start = request.requested_start;
+            let window_len = request.row_limit;
+            let secrets = db.list_secrets_page(&request.query, window_len, start)?;
             let total = match request.known_total {
                 Some(total) => total,
-                None => db.count_secrets(&request.query)?,
-            };
-            let window_len = request.row_limit.min(total);
-            let start = request
-                .requested_start
-                .min(total.saturating_sub(window_len));
-            let secrets = if total == 0 || window_len == 0 {
-                Vec::new()
-            } else {
-                db.list_secrets_page(&request.query, window_len, start)?
+                None => {
+                    if start == 0 && secrets.len() < window_len {
+                        secrets.len()
+                    } else {
+                        db.count_secrets(&request.query)?
+                    }
+                }
             };
             ListResults::Secrets {
                 total,
