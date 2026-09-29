@@ -23,6 +23,10 @@ fi
 rm -rf "${STAGE_DIR}" "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256"
 mkdir -p "${DIST_DIR}"
 
+# Never ship a build that fails the test suite, including the performance
+# regression tests.
+cargo test --workspace --locked
+
 cargo build \
   --release \
   --locked \

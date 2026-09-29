@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Includes the performance regression tests (db::perf_tests and the
+      # key-repeat/search-latency tests in rsclip-ui).
+      - name: Run tests
+        run: |
+          docker run --rm \
+            -v "$PWD":/work \
+            -w /work \
+            archlinux:base-devel \
+            bash -lc '
+              pacman -Syu --noconfirm --needed \
+                base-devel \
+                cargo \
+                gtk4 \
+                gtk4-layer-shell \
+                gtksourceview5 \
+                rust
+              cargo test --workspace --locked
+            '

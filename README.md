@@ -276,6 +276,25 @@ rsclip includes built-in hierarchical phase and memory profiling. Set `RSCLIP_PR
 RSCLIP_PROFILE=1 rsclip
 ```
 
+### Performance regression tests
+
+`cargo test` includes performance tests that fail on the regressions rsclip has
+hit before. `scripts/build-release-archive.sh` and CI run them on every build.
+
+- `rsclip-core` `db::perf_tests`: query plans for every filter and sort (no temp
+  b-tree sorts or unindexed scans), time budgets for every list, count, search,
+  preview, and store path on a 6,000-entry history, and a check that none of them
+  slow down when 48 MB of legacy payloads are added.
+- `rsclip-ui`: holding an arrow key through 5,000 entries never strands the
+  selection outside the loaded window, reloads stay rare, and each row is built
+  about once. Search starts at most 100 ms after the last keystroke.
+
+Print every measured timing:
+
+```bash
+RSCLIP_PERF_REPORT=1 cargo test -p rsclip-core perf_ -- --nocapture
+```
+
 ## Link favicons
 
 rsclip can optionally fetch real favicons for copied links. Network activity is disabled
