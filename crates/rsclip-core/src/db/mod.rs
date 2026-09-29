@@ -749,4 +749,52 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     }
+
+    #[test]
+    fn search_with_thousands_of_entries_stays_fast() {
+        let path = temp_db_path();
+        let mut db = Database::open(&path).unwrap();
+
+        let tx = db.conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    r#"
+                    INSERT INTO entries (
+                      content_hash, kind, mime_type, title, preview_text, text_content,
+                      copied_at, updated_at, size_bytes
+                    )
+                    VALUES (?1, 'text', 'text/plain', ?2, ?3, ?4, ?5, ?5, 100)
+                    "#,
+                )
+                .unwrap();
+
+            for i in 0..5_000 {
+                let hash = format!("hash-{i}");
+                let title = format!("Title for entry number {i}");
+                let preview = format!("Preview line snippet {i}");
+                let content = format!("Full text content line for clipboard entry index {i} with additional padding text");
+                stmt.execute(rusqlite::params![hash, title, preview, content, i as i64])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let start = std::time::Instant::now();
+        let page = db
+            .list_entry_summaries_page("snippet 499", EntryFilter::All, SortMode::Recent, 40, 0)
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(!page.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(30),
+            "5k-entry search took too long: {elapsed:?}"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
 }
