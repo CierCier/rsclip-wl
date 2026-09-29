@@ -10,7 +10,7 @@ use crate::components::labels::muted_label;
 use crate::components::list::{entry_row, secret_row};
 use crate::components::preview::clear_preview_state;
 use crate::state::{
-    AppState, AppView, current_entry_index, current_secret_index, row_index_for_entry,
+    AppState, AppView, RowKey, current_entry_index, current_secret_index, row_index_for_entry,
     row_index_for_secret,
 };
 
@@ -50,6 +50,8 @@ pub(crate) fn current_selected_index(state: &Rc<AppState>) -> usize {
 }
 
 pub(crate) fn rerender_current_list(state: &Rc<AppState>) {
+    // Row content itself changed (favicons, config): rebuild every row.
+    state.rendered_rows.borrow_mut().clear();
     let selected_index = selected_index(state).unwrap_or(visible_first_index(state));
     match *state.view.borrow() {
         AppView::Clipboard => render_clipboard_window(state, Some(selected_index), true),
@@ -68,33 +70,17 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
     }
 
     let first_visible = visible_first_index(state).min(total.saturating_sub(1));
-    let visible_rows = visible_row_count(state);
-    let current_start = current_start(state);
-    let current_len = current_len(state);
-    let desired_start = first_visible.saturating_sub(WINDOW_PADDING_ROWS);
-
-    // Only reload when approaching the edge of the loaded buffer (within 15 rows)
-    let reload_buffer = 15;
-    let near_top = first_visible < current_start.saturating_add(reload_buffer) && current_start > 0;
-    let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
-        > current_start.saturating_add(current_len)
-        && current_start.saturating_add(current_len) < total;
-
-    let needs_reload = current_len == 0 || near_top || near_bottom;
-
-    if !needs_reload {
+    let Some(normalized_start) = scroll_reload_start(
+        first_visible,
+        visible_row_count(state),
+        current_start(state),
+        current_len(state),
+        total,
+    ) else {
         return Ok(());
-    }
+    };
 
-    let window_len = window_row_count(state, total);
-    let normalized_start = normalized_window_start(desired_start, total, window_len);
-    if normalized_start == current_start
-        && current_len >= window_len.min(total.saturating_sub(current_start))
-    {
-        return Ok(());
-    }
-
-    let normalized_end = normalized_start.saturating_add(window_len);
+    let normalized_end = normalized_start.saturating_add(window_row_count(state, total));
     let selected_index = selected_index(state)
         .filter(|index| *index >= normalized_start && *index < normalized_end)
         .unwrap_or(first_visible);
@@ -107,6 +93,42 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
         true,
         Some(total),
     )
+}
+
+/// Rows between the viewport and the loaded window's edge that trigger a
+/// reload, so the next window arrives before the viewport runs out of rows.
+const RELOAD_EDGE_ROWS: usize = 15;
+
+/// Start of the window to load for a scroll position, or `None` while the
+/// viewport is comfortably inside the loaded window `current_start..+len`.
+fn scroll_reload_start(
+    first_visible: usize,
+    visible_rows: usize,
+    current_start: usize,
+    current_len: usize,
+    total: usize,
+) -> Option<usize> {
+    let current_end = current_start.saturating_add(current_len);
+    let near_top =
+        first_visible < current_start.saturating_add(RELOAD_EDGE_ROWS) && current_start > 0;
+    let near_bottom = first_visible
+        .saturating_add(visible_rows)
+        .saturating_add(RELOAD_EDGE_ROWS)
+        > current_end
+        && current_end < total;
+    if current_len != 0 && !near_top && !near_bottom {
+        return None;
+    }
+
+    let window_len = window_row_count_for(visible_rows, total);
+    let start = normalized_window_start(
+        first_visible.saturating_sub(WINDOW_PADDING_ROWS),
+        total,
+        window_len,
+    );
+    let already_loaded = start == current_start
+        && current_len >= window_len.min(total.saturating_sub(current_start));
+    (!already_loaded).then_some(start)
 }
 
 pub(crate) fn ensure_row_rendered(state: &Rc<AppState>, index: usize) -> Result<()> {
@@ -139,15 +161,11 @@ fn queue_window(
     let query = state.query.borrow().clone();
     let filter = *state.filter.borrow();
     let sort = *state.sort.borrow();
-    let requested_start = if current_total(state) == 0 {
-        requested_start
-    } else {
-        normalized_window_start(
-            requested_start,
-            current_total(state),
-            window_row_count(state, current_total(state)),
-        )
-    };
+    let (requested_start, row_limit) = fetch_window(
+        requested_start,
+        current_total(state),
+        visible_row_count(state),
+    );
     crate::events::queue_list(
         state,
         crate::state::ListRequest {
@@ -156,7 +174,7 @@ fn queue_window(
             query,
             filter,
             sort,
-            row_limit: search_window_row_count(state),
+            row_limit,
             requested_start,
             selected_index,
             preserve_scroll,
@@ -185,7 +203,10 @@ pub(crate) fn apply_clipboard_search_results(
     start: usize,
     entries: Vec<ClipboardEntry>,
 ) {
-    let live_selection = state.pending_selection.take().or_else(|| current_entry_index(state));
+    let live_selection = state
+        .pending_selection
+        .take()
+        .or_else(|| current_entry_index(state));
     state.secrets.borrow_mut().clear();
     state.secrets_start.set(0);
     state.secrets_total.set(0);
@@ -209,7 +230,10 @@ pub(crate) fn apply_secret_search_results(
     start: usize,
     secrets: Vec<SecretEntry>,
 ) {
-    let live_selection = state.pending_selection.take().or_else(|| current_secret_index(state));
+    let live_selection = state
+        .pending_selection
+        .take()
+        .or_else(|| current_secret_index(state));
     state.entries.borrow_mut().clear();
     state.entries_start.set(0);
     state.entries_total.set(0);
@@ -232,20 +256,18 @@ fn render_clipboard_window(
 ) {
     let scroll_value = state.list_adjustment.value();
     state.virtual_list_update.set(true);
-    crate::components::clear_list(&state.list);
 
-    let start = state.entries_start.get();
-    let total = state.entries_total.get();
-    append_top_spacer(state, start);
-
-    for entry in state.entries.borrow().iter() {
-        state
-            .list
-            .append(&entry_row(entry, &state.favicon_icon_dir));
+    {
+        let entries = state.entries.borrow();
+        let keys = entries.iter().map(RowKey::entry).collect();
+        render_rows(
+            state,
+            state.entries_start.get(),
+            state.entries_total.get(),
+            keys,
+            |index| entry_row(&entries[index], &state.favicon_icon_dir),
+        );
     }
-
-    let loaded_end = start.saturating_add(state.entries.borrow().len());
-    append_bottom_spacer(state, total.saturating_sub(loaded_end));
 
     select_clipboard_row(state, selected_index);
     update_clipboard_count(state);
@@ -266,18 +288,18 @@ fn render_secrets_window(
 ) {
     let scroll_value = state.list_adjustment.value();
     state.virtual_list_update.set(true);
-    crate::components::clear_list(&state.list);
 
-    let start = state.secrets_start.get();
-    let total = state.secrets_total.get();
-    append_top_spacer(state, start);
-
-    for secret in state.secrets.borrow().iter() {
-        state.list.append(&secret_row(secret));
+    {
+        let secrets = state.secrets.borrow();
+        let keys = secrets.iter().map(RowKey::secret).collect();
+        render_rows(
+            state,
+            state.secrets_start.get(),
+            state.secrets_total.get(),
+            keys,
+            |index| secret_row(&secrets[index]),
+        );
     }
-
-    let loaded_end = start.saturating_add(state.secrets.borrow().len());
-    append_bottom_spacer(state, total.saturating_sub(loaded_end));
 
     select_secret_row(state, selected_index);
     update_secret_count(state);
@@ -380,16 +402,110 @@ fn select_secret_row(state: &Rc<AppState>, selected_index: Option<usize>) {
     }
 }
 
-fn append_top_spacer(state: &Rc<AppState>, rows: usize) {
-    if rows > 0 {
-        state.list.append(&spacer_row(rows));
-    }
+/// Rows to drop from and add to each end of the rendered window so it shows
+/// the new window, keeping the overlapping rows untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RowShift {
+    drop_front: usize,
+    drop_back: usize,
+    add_front: usize,
+    add_back: usize,
 }
 
-fn append_bottom_spacer(state: &Rc<AppState>, rows: usize) {
-    if rows > 0 {
-        state.list.append(&spacer_row(rows));
+/// Plan an in-place update when `new` is `old` slid up or down (scrolling,
+/// key navigation, or an entry inserted at the top). `None` means the windows
+/// share no contiguous run and the list must be rebuilt.
+fn plan_row_shift(old: &[RowKey], new: &[RowKey]) -> Option<RowShift> {
+    let (first_old, first_new) = (old.first()?, new.first()?);
+
+    if let Some(skip) = old.iter().position(|key| key == first_new) {
+        let overlap = (old.len() - skip).min(new.len());
+        return (old[skip..skip + overlap] == new[..overlap]).then_some(RowShift {
+            drop_front: skip,
+            drop_back: old.len() - skip - overlap,
+            add_front: 0,
+            add_back: new.len() - overlap,
+        });
     }
+
+    let skip = new.iter().position(|key| key == first_old)?;
+    let overlap = old.len().min(new.len() - skip);
+    (new[skip..skip + overlap] == old[..overlap]).then_some(RowShift {
+        drop_front: 0,
+        drop_back: old.len() - overlap,
+        add_front: skip,
+        add_back: new.len() - skip - overlap,
+    })
+}
+
+/// Show the rows for `keys` (window `start` of `total`) between virtual spacers.
+///
+/// A window shift used to destroy and rebuild all ~120 rows on the GTK
+/// thread; rows still inside the new window are now kept, so a scroll reload
+/// only builds the rows that entered it.
+fn render_rows(
+    state: &Rc<AppState>,
+    start: usize,
+    total: usize,
+    keys: Vec<RowKey>,
+    make_row: impl Fn(usize) -> gtk4::ListBoxRow,
+) {
+    let list = &state.list;
+    let old = state.rendered_rows.replace(Vec::new());
+    let is_spacer = |child: &gtk4::Widget| child.has_css_class("virtual-spacer-row");
+    if let Some(child) = list.first_child().filter(is_spacer) {
+        list.remove(&child);
+    }
+    if let Some(child) = list.last_child().filter(is_spacer) {
+        list.remove(&child);
+    }
+
+    let shift = plan_row_shift(&old, &keys).filter(|_| list_len(list) == old.len());
+    match shift {
+        Some(shift) => {
+            for _ in 0..shift.drop_front {
+                if let Some(child) = list.first_child() {
+                    list.remove(&child);
+                }
+            }
+            for _ in 0..shift.drop_back {
+                if let Some(child) = list.last_child() {
+                    list.remove(&child);
+                }
+            }
+            for index in (0..shift.add_front).rev() {
+                list.prepend(&make_row(index));
+            }
+            for index in keys.len() - shift.add_back..keys.len() {
+                list.append(&make_row(index));
+            }
+        }
+        None => {
+            crate::components::clear_list(list);
+            for index in 0..keys.len() {
+                list.append(&make_row(index));
+            }
+        }
+    }
+
+    if start > 0 {
+        list.prepend(&spacer_row(start));
+    }
+    let remaining = total.saturating_sub(start.saturating_add(keys.len()));
+    if remaining > 0 {
+        list.append(&spacer_row(remaining));
+    }
+    *state.rendered_rows.borrow_mut() = keys;
+}
+
+fn list_len(list: &gtk4::ListBox) -> usize {
+    let mut len = 0;
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        len += 1;
+        child = widget.next_sibling();
+    }
+    len
 }
 
 fn spacer_row(rows: usize) -> gtk4::ListBoxRow {
@@ -494,9 +610,24 @@ fn window_row_count(state: &Rc<AppState>, total: usize) -> usize {
     window_row_count_for(visible_row_count(state), total)
 }
 
-/// Calculate the number of rows requested by the background list worker during search.
+/// Rows requested for the first page of a new search. It always starts at row
+/// 0, so it only has to cover the viewport; scrolling then loads full windows.
 pub(crate) fn search_window_row_count(state: &Rc<AppState>) -> usize {
     visible_row_count(state).saturating_add(20)
+}
+
+/// Start and row limit of a browsing window fetched for `requested_start`.
+///
+/// Callers request `target - WINDOW_PADDING_ROWS`, so the limit must span the
+/// padding plus the viewport: a shorter limit (the search page size) loads a
+/// window that ends above the target row, pinning key navigation in place.
+fn fetch_window(requested_start: usize, total: usize, visible_rows: usize) -> (usize, usize) {
+    let row_limit = window_row_count_for(visible_rows, usize::MAX);
+    if total == 0 {
+        return (requested_start, row_limit);
+    }
+    let start = normalized_window_start(requested_start, total, row_limit.min(total));
+    (start, row_limit)
 }
 
 fn window_row_count_for(visible_rows: usize, total: usize) -> usize {
@@ -574,9 +705,106 @@ fn update_secret_footer(state: &Rc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_window_index, normalized_window_start, resolve_window_selection,
-        window_row_count_for,
+        RowShift, WINDOW_PADDING_ROWS, clamp_window_index, fetch_window, normalized_window_start,
+        plan_row_shift, resolve_window_selection, scroll_reload_start, window_row_count_for,
     };
+    use crate::state::RowKey;
+
+    fn keys(ids: impl IntoIterator<Item = i64>) -> Vec<RowKey> {
+        ids.into_iter().map(RowKey::for_test).collect()
+    }
+
+    /// Apply a plan the way `render_rows` edits the ListBox.
+    fn apply(old: &[RowKey], new: &[RowKey], shift: RowShift) -> Vec<RowKey> {
+        let mut rows = old[shift.drop_front..old.len() - shift.drop_back].to_vec();
+        for index in (0..shift.add_front).rev() {
+            rows.insert(0, new[index]);
+        }
+        rows.extend_from_slice(&new[new.len() - shift.add_back..]);
+        rows
+    }
+
+    #[test]
+    fn row_shift_reuses_overlap_when_scrolling() {
+        let cases = [
+            (keys(0..120), keys(35..155)),  // scroll down one reload step
+            (keys(35..155), keys(0..120)),  // scroll up
+            (keys(0..120), keys(0..120)),   // same window re-applied
+            (keys(0..120), keys(60..100)),  // filtered/shrunk tail
+            (keys(0..40), keys(0..120)),    // search page grown to a full window
+            (keys(0..120), keys(119..239)), // one-row overlap
+        ];
+        for (old, new) in cases {
+            let shift = plan_row_shift(&old, &new).expect("windows overlap");
+            assert_eq!(apply(&old, &new, shift), new);
+        }
+
+        let shift = plan_row_shift(&keys(0..120), &keys(35..155)).unwrap();
+        assert_eq!(
+            shift,
+            RowShift {
+                drop_front: 35,
+                drop_back: 0,
+                add_front: 0,
+                add_back: 35
+            }
+        );
+    }
+
+    #[test]
+    fn row_shift_handles_entry_inserted_at_top() {
+        let old = keys(1..121);
+        let new: Vec<_> = keys([999]).into_iter().chain(keys(1..120)).collect();
+        let shift = plan_row_shift(&old, &new).unwrap();
+        assert_eq!((shift.add_front, shift.drop_back), (1, 1));
+        assert_eq!(apply(&old, &new, shift), new);
+    }
+
+    #[test]
+    fn row_shift_rebuilds_when_windows_do_not_line_up() {
+        assert_eq!(plan_row_shift(&keys(0..120), &keys(500..620)), None);
+        assert_eq!(plan_row_shift(&keys([1, 2, 3, 4]), &keys([1, 3, 4])), None);
+        assert_eq!(plan_row_shift(&[], &keys(0..10)), None);
+        assert_eq!(plan_row_shift(&keys(0..10), &[]), None);
+    }
+
+    /// Every navigation target must land inside the window fetched for it, or
+    /// the selection clamps back to the old edge and key-repeat gets stuck.
+    #[test]
+    fn fetched_window_always_contains_navigation_target() {
+        for visible_rows in [20_usize, 27, 45] {
+            for total in [1_usize, 19, 40, 41, 120, 121, 500, 5_368] {
+                for target in 0..total {
+                    let (start, limit) = fetch_window(
+                        target.saturating_sub(WINDOW_PADDING_ROWS),
+                        total,
+                        visible_rows,
+                    );
+                    let end = start + limit.min(total - start);
+                    assert!(
+                        start <= target && target < end,
+                        "target {target} outside fetched window {start}..{end} (total {total}, visible {visible_rows})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A scroll reload must cover the whole viewport, not just its first row.
+    #[test]
+    fn fetched_window_covers_scrolled_viewport() {
+        let visible_rows: usize = 20;
+        let total: usize = 5_368;
+        for first_visible in (0..total - visible_rows).step_by(7) {
+            let (start, limit) = fetch_window(
+                first_visible.saturating_sub(WINDOW_PADDING_ROWS),
+                total,
+                visible_rows,
+            );
+            let end = start + limit.min(total - start);
+            assert!(start <= first_visible && first_visible + visible_rows <= end);
+        }
+    }
 
     #[test]
     fn window_selection_preserves_live_selection_within_window() {
@@ -584,20 +812,11 @@ mod tests {
         // During reload fetch, user arrowed down to row 38.
         // The newly rendered window covers rows 0..100.
         // Live selection 38 must be preserved instead of reverting to 36.
-        assert_eq!(
-            resolve_window_selection(Some(38), 36, 0, 100),
-            Some(38)
-        );
+        assert_eq!(resolve_window_selection(Some(38), 36, 0, 100), Some(38));
         // If live selection fell outside the window bounds, fall back to request_selection.
-        assert_eq!(
-            resolve_window_selection(Some(150), 36, 0, 100),
-            Some(36)
-        );
+        assert_eq!(resolve_window_selection(Some(150), 36, 0, 100), Some(36));
         // If there was no live selection, fall back to request_selection.
-        assert_eq!(
-            resolve_window_selection(None, 36, 0, 100),
-            Some(36)
-        );
+        assert_eq!(resolve_window_selection(None, 36, 0, 100), Some(36));
     }
 
     #[test]
@@ -649,26 +868,91 @@ mod tests {
     }
 
     #[test]
-    fn scroll_within_window_buffer_does_not_trigger_reload() {
-        let current_start: usize = 0;
-        let current_len: usize = 120;
-        let total: usize = 5000;
-        let visible_rows: usize = 20;
-        let reload_buffer: usize = 15;
-
-        for first_visible in 0usize..=80 {
-            let near_top = first_visible < current_start.saturating_add(reload_buffer) && current_start > 0;
-            let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
-                > current_start.saturating_add(current_len)
-                && current_start.saturating_add(current_len) < total;
-            let needs_reload = current_len == 0 || near_top || near_bottom;
-            assert!(!needs_reload, "Unnecessary reload at first_visible = {first_visible}");
+    fn scrolling_inside_the_loaded_window_does_not_reload() {
+        let (visible, total) = (20, 5_000);
+        for first_visible in 0..=85 {
+            assert_eq!(
+                scroll_reload_start(first_visible, visible, 0, 120, total),
+                None,
+                "unnecessary reload at first_visible {first_visible}"
+            );
         }
+        assert!(scroll_reload_start(86, visible, 0, 120, total).is_some());
+        assert!(scroll_reload_start(0, visible, 0, 0, total).is_some());
+    }
 
-        let first_visible: usize = 90;
-        let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
-            > current_start.saturating_add(current_len)
-            && current_start.saturating_add(current_len) < total;
-        assert!(near_bottom, "Expected reload when approaching bottom boundary");
+    /// Hold an arrow key through a long history using the real windowing
+    /// functions, as the GTK code drives them.
+    ///
+    /// Returns (rows built, reloads). Panics if the selection ever falls
+    /// outside the loaded window, which is how v0.1.22 got stuck at row 39.
+    fn simulate_key_repeat(total: usize, visible: usize, down: bool) -> (usize, usize) {
+        let first = if down { 0 } else { total - 1 };
+        let (start, limit) =
+            fetch_window(first.saturating_sub(WINDOW_PADDING_ROWS), total, visible);
+        let window_for = |start: usize, limit: usize| {
+            keys(start as i64..(start + limit.min(total - start)) as i64)
+        };
+        let mut window_start = start;
+        let mut window = window_for(start, limit);
+        let (mut rows_built, mut reloads) = (window.len(), 0);
+
+        let order: Box<dyn Iterator<Item = usize>> = if down {
+            Box::new(0..total)
+        } else {
+            Box::new((0..total).rev())
+        };
+        for selected in order {
+            let inside = |start: usize, len: usize| start <= selected && selected < start + len;
+            let reload = if inside(window_start, window.len()) {
+                // scroll_row_into_view keeps the selection on the viewport edge.
+                let first_visible = if down {
+                    (selected + 1).saturating_sub(visible)
+                } else {
+                    selected
+                };
+                scroll_reload_start(first_visible, visible, window_start, window.len(), total)
+            } else {
+                // ensure_row_rendered: the selection outran the scroll reloads.
+                Some(selected.saturating_sub(WINDOW_PADDING_ROWS))
+            };
+            if let Some(requested) = reload {
+                let (start, limit) = fetch_window(requested, total, visible);
+                let new = window_for(start, limit);
+                let shift = plan_row_shift(&window, &new).expect("consecutive windows overlap");
+                rows_built += shift.add_front + shift.add_back;
+                reloads += 1;
+                window_start = start;
+                window = new;
+            }
+            assert!(
+                inside(window_start, window.len()),
+                "selection {selected} outside loaded window {window_start}..{}",
+                window_start + window.len()
+            );
+        }
+        (rows_built, reloads)
+    }
+
+    /// Holding Down/Up through 5k entries must never strand the selection,
+    /// must reload rarely, and (with row reuse) must build each row about
+    /// once instead of rebuilding the whole ~120-row window per reload.
+    #[test]
+    fn perf_key_repeat_through_history_builds_each_row_about_once() {
+        let total = 5_000;
+        for visible in [20, 45] {
+            for down in [true, false] {
+                let (rows_built, reloads) = simulate_key_repeat(total, visible, down);
+                let window = window_row_count_for(visible, total);
+                assert!(
+                    rows_built <= total + window,
+                    "built {rows_built} rows for {total} entries (visible {visible}, down {down}); window rows are being rebuilt"
+                );
+                assert!(
+                    reloads <= total / 25,
+                    "{reloads} reloads for {total} entries (visible {visible}, down {down})"
+                );
+            }
+        }
     }
 }

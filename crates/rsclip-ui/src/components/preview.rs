@@ -224,7 +224,7 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     };
 
     match &full.data {
-        EntryData::Image { .. } => render_image_preview(&state.preview, &full),
+        EntryData::Image { .. } => render_image_preview(state, &full),
         EntryData::Color { value, .. } => render_color_preview(state, value),
         EntryData::Link { url, .. } => {
             render_text_preview_state(state, Some(url));
@@ -275,30 +275,143 @@ pub(crate) fn clear_preview_state(state: &Rc<AppState>) {
     state.ocr_button.set_sensitive(false);
 }
 
-fn render_image_preview(container: &gtk::Box, entry: &ClipboardEntry) {
+/// Render an image preview without decoding on the GTK thread.
+///
+/// Decoding a 1920x1080 PNG takes tens of milliseconds; doing it inline on
+/// every selection made arrowing through screenshots stutter. The frame is
+/// sized from the file header immediately, the pixels decode on a GIO worker
+/// thread, and recently shown images come from a small cache.
+fn render_image_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     rsclip_core::profiler::begin_phase("render_image_preview");
-    if let EntryData::Image { file_path, .. } = &entry.data {
-        let file = gio::File::for_path(file_path);
-        if let Ok(texture) = gdk::Texture::from_file(&file) {
-            let ratio = (texture.width() as f32 / texture.height().max(1) as f32).clamp(0.2, 8.0);
-            let frame = gtk::AspectFrame::new(0.5, 0.5, ratio, false);
-            frame.set_hexpand(true);
-            frame.set_vexpand(true);
+    let EntryData::Image { file_path, .. } = &entry.data else {
+        state.preview.append(&muted_label("Image file is missing"));
+        rsclip_core::profiler::end_phase("render_image_preview");
+        return;
+    };
 
-            let picture = gtk::Picture::for_paintable(&texture);
-            picture.set_content_fit(gtk::ContentFit::Contain);
-            picture.set_can_shrink(true);
-            picture.set_hexpand(true);
-            picture.set_vexpand(true);
-            frame.set_child(Some(&picture));
-            container.append(&frame);
-        } else {
-            container.append(&muted_label("Image preview is unavailable"));
-        }
-    } else {
-        container.append(&muted_label("Image file is missing"));
+    if let Some(texture) = cached_image(file_path) {
+        let (frame, picture) = image_frame(texture.width(), texture.height());
+        picture.set_paintable(Some(&texture));
+        state.preview.append(&frame);
+        rsclip_core::profiler::end_phase("render_image_preview");
+        return;
     }
+
+    let Some((_, width, height)) = gdk_pixbuf::Pixbuf::file_info(file_path) else {
+        state
+            .preview
+            .append(&muted_label("Image preview is unavailable"));
+        rsclip_core::profiler::end_phase("render_image_preview");
+        return;
+    };
+    let (frame, picture) = image_frame(width, height);
+    state.preview.append(&frame);
+
+    let state = Rc::clone(state);
+    let generation = state.preview_generation.get();
+    let path = file_path.clone();
+    gtk::glib::spawn_future_local(async move {
+        let decode_path = path.clone();
+        let texture = gio::spawn_blocking(move || decode_image_preview(&decode_path))
+            .await
+            .ok()
+            .flatten();
+        if let Some(texture) = &texture {
+            cache_image(path, texture.clone());
+        }
+        if state.preview_generation.get() != generation {
+            return;
+        }
+        match texture {
+            Some(texture) => picture.set_paintable(Some(&texture)),
+            None if frame.parent().is_some() => {
+                state
+                    .preview
+                    .insert_child_after(&muted_label("Image preview is unavailable"), Some(&frame));
+                state.preview.remove(&frame);
+            }
+            None => {}
+        }
+    });
     rsclip_core::profiler::end_phase("render_image_preview");
+}
+
+/// Longest decoded edge for image previews; larger images are scaled while
+/// decoding so cached textures stay a few megabytes each.
+const IMAGE_PREVIEW_MAX_EDGE: i32 = 1600;
+const IMAGE_PREVIEW_CACHE_LEN: usize = 6;
+
+thread_local! {
+    /// Recently decoded image previews, most recently used last.
+    static IMAGE_PREVIEW_CACHE: std::cell::RefCell<std::collections::VecDeque<(String, gdk::Texture)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn cached_image(path: &str) -> Option<gdk::Texture> {
+    IMAGE_PREVIEW_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|(cached, _)| cached == path)?;
+        let item = cache.remove(index)?;
+        let texture = item.1.clone();
+        cache.push_back(item);
+        Some(texture)
+    })
+}
+
+fn cache_image(path: String, texture: gdk::Texture) {
+    IMAGE_PREVIEW_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(cached, _)| *cached != path);
+        cache.push_back((path, texture));
+        while cache.len() > IMAGE_PREVIEW_CACHE_LEN {
+            cache.pop_front();
+        }
+    });
+}
+
+/// Decode an image for previewing. Runs on a GIO worker thread.
+fn decode_image_preview(path: &str) -> Option<gdk::Texture> {
+    let (_, width, height) = gdk_pixbuf::Pixbuf::file_info(path)?;
+    if width <= IMAGE_PREVIEW_MAX_EDGE && height <= IMAGE_PREVIEW_MAX_EDGE {
+        return gdk::Texture::from_filename(path).ok();
+    }
+
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(
+        path,
+        IMAGE_PREVIEW_MAX_EDGE,
+        IMAGE_PREVIEW_MAX_EDGE,
+        true,
+    )
+    .ok()?;
+    let format = if pixbuf.has_alpha() {
+        gdk::MemoryFormat::R8g8b8a8
+    } else {
+        gdk::MemoryFormat::R8g8b8
+    };
+    let texture = gdk::MemoryTexture::new(
+        pixbuf.width(),
+        pixbuf.height(),
+        format,
+        &pixbuf.read_pixel_bytes(),
+        pixbuf.rowstride() as usize,
+    );
+    Some(texture.upcast())
+}
+
+/// Aspect-correct frame for an image whose pixels may arrive later.
+fn image_frame(width: i32, height: i32) -> (gtk::AspectFrame, gtk::Picture) {
+    let ratio = (width as f32 / height.max(1) as f32).clamp(0.2, 8.0);
+    let frame = gtk::AspectFrame::new(0.5, 0.5, ratio, false);
+    frame.set_hexpand(true);
+    frame.set_vexpand(true);
+
+    let picture = gtk::Picture::new();
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
+    frame.set_child(Some(&picture));
+    (frame, picture)
 }
 
 fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
@@ -446,17 +559,26 @@ fn full_entry_for_preview(state: &Rc<AppState>, entry: &ClipboardEntry) -> Clipb
     }
 
     rsclip_core::profiler::begin_phase("query_full_entry");
-    // The preview pane truncates at MAX_FULL_PREVIEW_BYTES anyway; cap the SQL
-    // read to match so a legacy multi-megabyte payload cannot stall the GTK
-    // thread. Copying still uses the full row via Database::get_entry.
-    let result = state
-        .db
-        .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| entry.clone());
+    let result = with_preview_text(state, entry).unwrap_or_else(|| entry.clone());
     rsclip_core::profiler::end_phase("query_full_entry");
     result
+}
+
+/// The summary row with its text replaced by the bounded preview body.
+///
+/// Only the capped body is read (the preview truncates at
+/// MAX_FULL_PREVIEW_BYTES anyway); every other field already came with the
+/// summary, so a legacy multi-megabyte row never stalls the GTK thread.
+/// Copying still uses the full row via Database::get_entry.
+fn with_preview_text(state: &Rc<AppState>, entry: &ClipboardEntry) -> Option<ClipboardEntry> {
+    let text = state
+        .db
+        .get_text_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
+        .ok()
+        .flatten()?;
+    let mut full = entry.clone();
+    full.text_content = Some(text);
+    Some(full)
 }
 
 fn is_binary_payload(text: &str) -> bool {
@@ -486,12 +608,7 @@ fn schedule_preview_upgrade(state: &Rc<AppState>, entry: ClipboardEntry, generat
         if current != Some(entry.id) || generation != state.preview_generation.get() {
             return;
         }
-        let Some(full) = state
-            .db
-            .get_entry_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
-            .ok()
-            .flatten()
-        else {
+        let Some(full) = with_preview_text(&state, &entry) else {
             return;
         };
         match &full.data {

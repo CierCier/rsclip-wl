@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
 use gtk::prelude::*;
@@ -150,20 +152,41 @@ fn entry_icon(
     }
 }
 
+thread_local! {
+    /// Decoded favicons by domain (`None` = no cached icon on disk). Every
+    /// window shift rebuilds link rows; without this each one stat'ed and
+    /// decoded its PNG on the GTK thread.
+    static FAVICON_CACHE: RefCell<HashMap<String, Option<gdk_pixbuf::Pixbuf>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Forget decoded favicons so newly fetched icons are picked up.
+pub(crate) fn clear_favicon_cache() {
+    FAVICON_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+fn cached_favicon(favicon_icon_dir: &Path, domain: &str) -> Option<gdk_pixbuf::Pixbuf> {
+    FAVICON_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(domain.to_string())
+            .or_insert_with(|| {
+                let path = favicon_icon_dir.join(format!("{}.png", domain_cache_key(domain)));
+                gdk_pixbuf::Pixbuf::from_file_at_scale(&path, FAVICON_SIZE, FAVICON_SIZE, true).ok()
+            })
+            .clone()
+    })
+}
+
 fn link_icon(favicon_icon_dir: &Path, domain: &str) -> gtk::Widget {
-    let path = favicon_icon_dir.join(format!("{}.png", domain_cache_key(domain)));
-    if path.exists() {
-        let pixbuf =
-            gdk_pixbuf::Pixbuf::from_file_at_scale(&path, FAVICON_SIZE, FAVICON_SIZE, true);
-        if let Ok(pixbuf) = pixbuf {
-            let icon = gtk::Image::from_pixbuf(Some(&pixbuf));
-            icon.add_css_class("link-favicon");
-            icon.set_width_request(FAVICON_SIZE);
-            icon.set_height_request(FAVICON_SIZE);
-            icon.set_halign(gtk::Align::Center);
-            icon.set_valign(gtk::Align::Center);
-            return favicon_slot(icon.upcast(), domain);
-        }
+    if let Some(pixbuf) = cached_favicon(favicon_icon_dir, domain) {
+        let icon = gtk::Image::from_pixbuf(Some(&pixbuf));
+        icon.add_css_class("link-favicon");
+        icon.set_width_request(FAVICON_SIZE);
+        icon.set_height_request(FAVICON_SIZE);
+        icon.set_halign(gtk::Align::Center);
+        icon.set_valign(gtk::Align::Center);
+        return favicon_slot(icon.upcast(), domain);
     }
 
     let fallback = gtk::Label::new(Some("\u{f0c1}"));

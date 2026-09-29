@@ -3,6 +3,7 @@ use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
 use crate::models::{ClipboardEntry, EntryFilter, NewEntry, NewEntryData, SortMode};
+use crate::syntax::{CodeLanguage, detect_code_language};
 
 use super::{Database, rows::entry_from_row};
 
@@ -67,7 +68,7 @@ impl Database {
             NewEntryData::Unknown => (None, None, None, None, None, None, None, None),
         };
 
-        self.conn.execute(
+        let id = self.conn.query_row(
             r#"
             INSERT INTO entries (
               content_hash, kind, mime_type, title, preview_text, text_content,
@@ -92,6 +93,7 @@ impl Database {
               updated_at=excluded.updated_at,
               size_bytes=excluded.size_bytes,
               deleted=0
+            RETURNING id
             "#,
             params![
                 entry.content_hash,
@@ -112,12 +114,17 @@ impl Database {
                 now,
                 entry.size_bytes,
             ],
+            |row| row.get::<_, i64>(0),
         )?;
-        let id = self.conn.query_row(
-            "SELECT id FROM entries WHERE content_hash = ?1",
-            params![entry.content_hash],
-            |row| row.get::<_, i64>("id"),
-        )?;
+
+        // The entry_text triggers stored the bounded body; record the detected
+        // language beside it so the Code/Text filters never re-run detection.
+        if let Some(lang) = code_language_for(entry) {
+            self.conn.execute(
+                "UPDATE entry_text SET code_lang = ?2 WHERE entry_id = ?1",
+                params![id, lang.sourceview_id()],
+            )?;
+        }
         Ok(id)
     }
 
@@ -170,30 +177,9 @@ impl Database {
         offset: usize,
         include_text_payload: bool,
     ) -> Result<Vec<ClipboardEntry>> {
-        let columns = entry_select_columns(include_text_payload);
-        let mut sql = format!(
-            r#"
-            SELECT {columns}
-            FROM entries e
-            LEFT JOIN ocr_results o ON o.entry_id = e.id
-            WHERE e.deleted = 0
-            "#,
-        );
-
-        append_entry_filter(&mut sql, filter);
         let has_query = !query.trim().is_empty();
-        if has_query {
-            append_entry_search(&mut sql);
-        }
-
-        sql.push_str(entry_order(sort));
-        if has_query {
-            sql.push_str(" LIMIT ?2 OFFSET ?3");
-        } else {
-            sql.push_str(" LIMIT ?1 OFFSET ?2");
-        }
-
-        let mut stmt = self.conn.prepare(&sql)?;
+        let sql = entry_page_sql(filter, sort, has_query, include_text_payload);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = if has_query {
             let pattern = format!("%{}%", query.trim());
             stmt.query_map(
@@ -211,19 +197,14 @@ impl Database {
     /// Returns the count of active entries matching the query and filter.
     pub fn count_entries(&self, query: &str, filter: EntryFilter) -> Result<usize> {
         let has_query = !query.trim().is_empty();
-        let mut sql = String::from("SELECT COUNT(*) FROM entries e WHERE e.deleted = 0");
-
-        append_entry_filter(&mut sql, filter);
-        if has_query {
-            append_entry_search(&mut sql);
-        }
+        let sql = entry_count_sql(filter, has_query);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
 
         let count = if has_query {
             let pattern = format!("%{}%", query.trim());
-            self.conn
-                .query_row(&sql, params![pattern], |row| row.get::<_, i64>(0))?
+            stmt.query_row(params![pattern], |row| row.get::<_, i64>(0))?
         } else {
-            self.conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?
+            stmt.query_row([], |row| row.get::<_, i64>(0))?
         };
         Ok(count.max(0) as usize)
     }
@@ -294,32 +275,37 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Load one entry for preview rendering, with the text payload capped to
-    /// [`PREVIEW_TEXT_LIMIT_BYTES`].
+    /// Load the first `limit_chars` characters of a text entry for previewing.
     ///
-    /// The preview pane truncates at 64 KiB anyway; reading a legacy 40 MB row
-    /// in full would copy tens of megabytes on the GTK thread per keypress.
-    /// [`Database::get_entry`] still returns the complete payload for copying.
-    pub fn get_entry_preview(&self, id: i64, limit: usize) -> Result<Option<ClipboardEntry>> {
+    /// Reads the bounded `entry_text` copy, never `entries`: SQLite loads a
+    /// whole TEXT value even under `substr`, and every column stored after
+    /// `text_content` sits behind its overflow chain, so touching a legacy
+    /// 40 MB row cost 10+ ms on the GTK thread. Combine with the list summary
+    /// row for everything else; [`Database::get_entry`] still returns the
+    /// complete payload for copying.
+    pub fn get_text_preview(&self, id: i64, limit_chars: usize) -> Result<Option<String>> {
+        if limit_chars <= super::ENTRY_TEXT_PREFIX_CHARS {
+            let body = self
+                .conn
+                .query_row(
+                    "SELECT substr(body, 1, ?2) FROM entry_text WHERE entry_id = ?1",
+                    params![id, limit_chars as i64],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if body.is_some() {
+                return Ok(body);
+            }
+        }
+
         self.conn
             .query_row(
-                r#"
-                SELECT
-                  e.id, e.content_hash, e.kind, e.mime_type, e.title, e.preview_text,
-                  CASE WHEN e.kind = 'text' THEN substr(e.text_content, 1, ?2)
-                       ELSE e.text_content END AS text_content,
-                  e.file_path, e.thumb_path, e.source_app, e.link_url,
-                  e.link_domain, e.link_icon, e.color_value, e.color_format, e.pinned,
-                  e.copied_at, e.updated_at, e.last_used_at, e.use_count, e.size_bytes,
-                  o.text AS ocr_text
-                FROM entries e
-                LEFT JOIN ocr_results o ON o.entry_id = e.id
-                WHERE e.id = ?1 AND e.deleted = 0
-                "#,
-                params![id, limit as i64],
-                entry_from_row,
+                "SELECT substr(text_content, 1, ?2) FROM entries WHERE id = ?1 AND deleted = 0",
+                params![id, limit_chars as i64],
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()
+            .map(Option::flatten)
             .map_err(Into::into)
     }
 
@@ -372,6 +358,49 @@ impl Database {
     }
 }
 
+/// SQL for one page of entries: `?1` is the search pattern when `has_query`,
+/// followed by LIMIT and OFFSET.
+pub(super) fn entry_page_sql(
+    filter: EntryFilter,
+    sort: SortMode,
+    has_query: bool,
+    include_text_payload: bool,
+) -> String {
+    let columns = entry_select_columns(include_text_payload);
+    let mut sql = format!(
+        r#"
+        SELECT {columns}
+        FROM entries e
+        LEFT JOIN ocr_results o ON o.entry_id = e.id
+        WHERE e.deleted = 0
+        "#,
+    );
+
+    append_entry_filter(&mut sql, filter);
+    if has_query {
+        append_entry_search(&mut sql);
+    }
+
+    sql.push_str(entry_order(sort));
+    if has_query {
+        sql.push_str(" LIMIT ?2 OFFSET ?3");
+    } else {
+        sql.push_str(" LIMIT ?1 OFFSET ?2");
+    }
+    sql
+}
+
+/// SQL counting the entries a page query can return; `?1` is the search
+/// pattern when `has_query`.
+pub(super) fn entry_count_sql(filter: EntryFilter, has_query: bool) -> String {
+    let mut sql = String::from("SELECT COUNT(*) FROM entries e WHERE e.deleted = 0");
+    append_entry_filter(&mut sql, filter);
+    if has_query {
+        append_entry_search(&mut sql);
+    }
+    sql
+}
+
 fn entry_select_columns(include_text_payload: bool) -> String {
     if include_text_payload {
         r#"
@@ -410,14 +439,14 @@ fn entry_select_columns(include_text_payload: bool) -> String {
     }
 }
 
-fn append_entry_filter(sql: &mut String, filter: EntryFilter) {
+pub(super) fn append_entry_filter(sql: &mut String, filter: EntryFilter) {
     sql.push_str(match filter {
         EntryFilter::All => "",
         EntryFilter::Code => {
-            " AND e.kind = 'text' AND is_code(COALESCE(e.preview_text, e.text_content, e.title)) = 1"
+            " AND e.kind = 'text' AND EXISTS (SELECT 1 FROM entry_text t WHERE t.entry_id = e.id AND t.code_lang IS NOT NULL)"
         }
         EntryFilter::Text => {
-            " AND e.kind = 'text' AND is_code(COALESCE(e.preview_text, e.text_content, e.title)) = 0"
+            " AND e.kind = 'text' AND NOT EXISTS (SELECT 1 FROM entry_text t WHERE t.entry_id = e.id AND t.code_lang IS NOT NULL)"
         }
         EntryFilter::Images => " AND e.kind = 'image'",
         EntryFilter::Files => " AND e.kind = 'file'",
@@ -427,18 +456,40 @@ fn append_entry_filter(sql: &mut String, filter: EntryFilter) {
     });
 }
 
-fn append_entry_search(sql: &mut String) {
+/// Text bodies are matched through the bounded `entry_text` copy: a LIKE (or
+/// `substr`) over `entries.text_content` loads each full payload first, which
+/// made every search keystroke read all 50 MB of a large history.
+pub(super) fn append_entry_search(sql: &mut String) {
     sql.push_str(
         r#"
         AND (
           e.title LIKE ?1 OR e.preview_text LIKE ?1
-          OR (e.kind = 'text' AND substr(e.text_content, 1, 16384) LIKE ?1)
+          OR (e.kind = 'text' AND EXISTS (SELECT 1 FROM entry_text t WHERE t.entry_id = e.id AND t.body LIKE ?1))
           OR (e.kind = 'link' AND (e.link_url LIKE ?1 OR e.link_domain LIKE ?1))
           OR (e.kind = 'color' AND e.color_value LIKE ?1)
           OR (e.kind = 'image' AND EXISTS (SELECT 1 FROM ocr_results o WHERE o.entry_id = e.id AND o.text LIKE ?1))
         )
         "#,
     );
+}
+
+/// Language of a new text entry, detected from the same sample the list uses.
+fn code_language_for(entry: &NewEntry) -> Option<CodeLanguage> {
+    if !matches!(entry.data, NewEntryData::Text) {
+        return None;
+    }
+    let sample = entry
+        .preview_text
+        .as_deref()
+        .or(entry.text_content.as_deref())
+        .unwrap_or(&entry.title);
+    detect_code_language(bounded_prefix(sample, super::ENTRY_TEXT_PREFIX_CHARS))
+}
+
+fn bounded_prefix(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map_or(text, |(index, _)| &text[..index])
 }
 
 fn entry_order(sort: SortMode) -> &'static str {

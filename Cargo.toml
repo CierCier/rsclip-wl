@@ -33,3 +33,8 @@ image = { version = "0.25.10", default-features = false, features = ["ico", "png
 scraper = "0.27.0"
 sourceview5 = { version = "0.10", features = ["v5_10"] }
 
+
+# Optimize the bundled SQLite in dev/test builds too: the performance tests
+# time real queries, and unoptimized C SQLite is ~5-10x slower than release.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

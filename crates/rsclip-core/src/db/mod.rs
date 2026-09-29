@@ -1,11 +1,18 @@
 mod entries;
 mod ocr;
+#[cfg(test)]
+mod perf_tests;
 mod rows;
 mod schema;
 mod secrets;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+
+/// Characters of each text entry kept in the `entry_text` side table. Search
+/// scans this prefix, and previews (capped at 64 KiB) read it instead of the
+/// full payload. `substr` counts characters, so this covers 64 KiB + 1 bytes.
+pub const ENTRY_TEXT_PREFIX_CHARS: usize = 64 * 1024 + 1;
 
 /// SQLite database connection handle for rsclip history, secrets, and OCR results.
 pub struct Database {
@@ -22,11 +29,14 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Truncate the WAL after checkpoints: long-lived UI connections would
+        // otherwise keep it at its peak size (one large write can grow it to
+        // tens of megabytes).
+        conn.pragma_update(None, "journal_size_limit", 16 * 1024 * 1024)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "cache_size", -64000)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        register_sqlite_functions(&conn)?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -44,23 +54,6 @@ impl Database {
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
-}
-
-fn register_sqlite_functions(conn: &Connection) -> Result<()> {
-    use rusqlite::functions::FunctionFlags;
-    conn.create_scalar_function(
-        "is_code",
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let val = ctx.get::<Option<String>>(0)?;
-            Ok(match val {
-                Some(text) => crate::syntax::detect_code_language(&text).is_some(),
-                None => false,
-            })
-        },
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -641,7 +634,10 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             let plan = plan_rows.join("\n");
-            assert!(!plan.contains("USE TEMP B-TREE"), "Default sort plan used temp b-tree: {plan}");
+            assert!(
+                !plan.contains("USE TEMP B-TREE"),
+                "Default sort plan used temp b-tree: {plan}"
+            );
             assert!(
                 plan.contains("idx_entries_pinned_updated") || plan.contains("idx_entries_pinned"),
                 "Default sort plan did not use index: {plan}"
@@ -660,8 +656,14 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             let plan = plan_rows.join("\n");
-            assert!(!plan.contains("USE TEMP B-TREE"), "Recent sort plan used temp b-tree: {plan}");
-            assert!(plan.contains("idx_entries_updated_at"), "Recent sort plan did not use index: {plan}");
+            assert!(
+                !plan.contains("USE TEMP B-TREE"),
+                "Recent sort plan used temp b-tree: {plan}"
+            );
+            assert!(
+                plan.contains("idx_entries_updated_at"),
+                "Recent sort plan did not use index: {plan}"
+            );
         }
 
         // 3. Type sort (kind ASC, updated_at DESC)
@@ -676,8 +678,14 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             let plan = plan_rows.join("\n");
-            assert!(!plan.contains("USE TEMP B-TREE"), "Type sort plan used temp b-tree: {plan}");
-            assert!(plan.contains("idx_entries_type_sort"), "Type sort plan did not use index: {plan}");
+            assert!(
+                !plan.contains("USE TEMP B-TREE"),
+                "Type sort plan used temp b-tree: {plan}"
+            );
+            assert!(
+                plan.contains("idx_entries_type_sort"),
+                "Type sort plan did not use index: {plan}"
+            );
         }
 
         // 4. MostUsed sort (use_count DESC, updated_at DESC)
@@ -692,8 +700,14 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             let plan = plan_rows.join("\n");
-            assert!(!plan.contains("USE TEMP B-TREE"), "MostUsed sort plan used temp b-tree: {plan}");
-            assert!(plan.contains("idx_entries_most_used"), "MostUsed sort plan did not use index: {plan}");
+            assert!(
+                !plan.contains("USE TEMP B-TREE"),
+                "MostUsed sort plan used temp b-tree: {plan}"
+            );
+            assert!(
+                plan.contains("idx_entries_most_used"),
+                "MostUsed sort plan did not use index: {plan}"
+            );
         }
 
         // 5. Kind filter with MostUsed sort (use_count DESC, updated_at DESC)
@@ -708,8 +722,14 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             let plan = plan_rows.join("\n");
-            assert!(!plan.contains("USE TEMP B-TREE"), "Kind + MostUsed sort plan used temp b-tree: {plan}");
-            assert!(plan.contains("idx_entries_kind_used"), "Kind + MostUsed sort plan did not use index: {plan}");
+            assert!(
+                !plan.contains("USE TEMP B-TREE"),
+                "Kind + MostUsed sort plan used temp b-tree: {plan}"
+            );
+            assert!(
+                plan.contains("idx_entries_kind_used"),
+                "Kind + MostUsed sort plan did not use index: {plan}"
+            );
         }
 
         drop(db);
@@ -738,11 +758,16 @@ mod tests {
             .unwrap();
 
         let start = std::time::Instant::now();
-        let count = db.count_entries("nonexistent-needle", EntryFilter::All).unwrap();
+        let count = db
+            .count_entries("nonexistent-needle", EntryFilter::All)
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert_eq!(count, 0);
-        assert!(elapsed < std::time::Duration::from_millis(100), "Search took too long: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Search took too long: {elapsed:?}"
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -773,7 +798,9 @@ mod tests {
                 let hash = format!("hash-{i}");
                 let title = format!("Title for entry number {i}");
                 let preview = format!("Preview line snippet {i}");
-                let content = format!("Full text content line for clipboard entry index {i} with additional padding text");
+                let content = format!(
+                    "Full text content line for clipboard entry index {i} with additional padding text"
+                );
                 stmt.execute(rusqlite::params![hash, title, preview, content, i as i64])
                     .unwrap();
             }
@@ -791,6 +818,370 @@ mod tests {
             elapsed < std::time::Duration::from_millis(30),
             "5k-entry search took too long: {elapsed:?}"
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    /// Guard the invariant behind search/filter speed: SQLite loads a whole
+    /// TEXT value before `substr`/`LIKE` run, so any hot-path predicate that
+    /// touches `e.text_content` scans every multi-megabyte payload per query.
+    #[test]
+    fn search_and_filter_sql_never_touch_full_text_payload() {
+        let mut sql = String::new();
+        super::entries::append_entry_search(&mut sql);
+        for filter in [
+            EntryFilter::All,
+            EntryFilter::Code,
+            EntryFilter::Text,
+            EntryFilter::Images,
+            EntryFilter::Files,
+            EntryFilter::Links,
+            EntryFilter::Colors,
+            EntryFilter::Pinned,
+        ] {
+            super::entries::append_entry_filter(&mut sql, filter);
+        }
+        assert!(
+            !sql.contains("text_content"),
+            "hot-path SQL must use entry_text, not entries.text_content: {sql}"
+        );
+        assert!(
+            !sql.contains("is_code("),
+            "per-row language detection in SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn entry_text_tracks_inserts_updates_and_bounds_payloads() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+
+        let prefix = super::ENTRY_TEXT_PREFIX_CHARS;
+        let mut entry = text_entry("bounded-hash", "bounded");
+        let payload = format!("{}deep-needle", "y".repeat(prefix));
+        entry.text_content = Some(payload.clone());
+        let id = db.upsert_entry(&entry).unwrap();
+
+        let body_len: i64 = db
+            .conn
+            .query_row(
+                "SELECT length(body) FROM entry_text WHERE entry_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body_len as usize, prefix);
+
+        // Search is bounded to the stored prefix; the full row stays intact.
+        assert_eq!(
+            db.count_entries("deep-needle", EntryFilter::All).unwrap(),
+            0
+        );
+        assert_eq!(db.count_entries("yyyy", EntryFilter::Text).unwrap(), 1);
+        assert_eq!(
+            db.get_entry(id).unwrap().unwrap().text_content.as_deref(),
+            Some(payload.as_str())
+        );
+        assert_eq!(
+            db.get_text_preview(id, 16).unwrap().as_deref(),
+            Some("yyyyyyyyyyyyyyyy")
+        );
+
+        // Updating the payload (any writer, including raw SQL) re-syncs the body.
+        db.conn
+            .execute(
+                "UPDATE entries SET text_content = 'fn main() { later_needle(); }' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.count_entries("later_needle", EntryFilter::All).unwrap(),
+            1
+        );
+
+        // Leaving the text kind drops the row from the text index.
+        db.conn
+            .execute("UPDATE entries SET kind = 'color' WHERE id = ?1", [id])
+            .unwrap();
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_text WHERE entry_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn upsert_conflict_keeps_code_language() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+        let code = "fn main() {\n    println!(\"Hello world\");\n}";
+
+        let first = db.upsert_entry(&text_entry("same-hash", code)).unwrap();
+        // Copying the same content again takes the ON CONFLICT path, whose
+        // update trigger rebuilds the entry_text row.
+        let second = db.upsert_entry(&text_entry("same-hash", code)).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(db.count_entries("", EntryFilter::Code).unwrap(), 1);
+        assert_eq!(db.count_entries("", EntryFilter::Text).unwrap(), 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn migration_v4_backfills_entry_text_and_code_languages() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+        let code = "fn main() {\n    println!(\"Hello world\");\n}";
+        let prose = "Meeting at 3pm today with team to discuss roadmap";
+
+        // Recreate a v3 database: rows exist, the side table does not.
+        db.conn
+            .execute_batch(
+                r#"
+                DROP TRIGGER entry_text_after_insert;
+                DROP TRIGGER entry_text_after_update;
+                DROP TRIGGER entry_text_after_delete;
+                DROP TABLE entry_text;
+                PRAGMA user_version = 3;
+                "#,
+            )
+            .unwrap();
+        for (hash, text) in [("legacy-code", code), ("legacy-prose", prose)] {
+            db.conn
+                .execute(
+                    r#"
+                    INSERT INTO entries (
+                      content_hash, kind, mime_type, title, preview_text, text_content,
+                      copied_at, updated_at, size_bytes
+                    )
+                    VALUES (?1, 'text', 'text/plain', ?2, ?2, ?2, 1, 1, 10)
+                    "#,
+                    rusqlite::params![hash, text],
+                )
+                .unwrap();
+        }
+
+        db.migrate().unwrap();
+
+        assert_eq!(db.count_entries("", EntryFilter::Code).unwrap(), 1);
+        assert_eq!(db.count_entries("", EntryFilter::Text).unwrap(), 1);
+        assert_eq!(db.count_entries("println", EntryFilter::All).unwrap(), 1);
+        let code_lang: String = db
+            .conn
+            .query_row(
+                "SELECT t.code_lang FROM entry_text t JOIN entries e ON e.id = t.entry_id WHERE e.content_hash = 'legacy-code'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(code_lang, "rust");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    /// Code/Text used to run the language detector per row inside SQL for
+    /// every page and count (9 ms each on a real 5k history in release).
+    #[test]
+    fn code_and_text_filters_stay_fast_with_thousands_of_entries() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+
+        db.transaction(|db| {
+            for i in 0..5_000 {
+                let text = if i % 5 == 0 {
+                    format!("fn function_{i}() -> usize {{\n    let x = {i};\n    x\n}}")
+                } else {
+                    format!("Plain clipboard note number {i} about the weekly plan")
+                };
+                db.upsert_entry(&text_entry(&format!("filter-hash-{i}"), &text))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        for filter in [EntryFilter::Code, EntryFilter::Text] {
+            let start = std::time::Instant::now();
+            let count = db.count_entries("", filter).unwrap();
+            let page = db
+                .list_entry_summaries_page(
+                    "",
+                    filter,
+                    SortMode::Default,
+                    120,
+                    count.saturating_sub(120),
+                )
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(!page.is_empty());
+            assert!(
+                elapsed < std::time::Duration::from_millis(30),
+                "{filter:?} count + deepest page took too long: {elapsed:?}"
+            );
+        }
+        assert_eq!(db.count_entries("", EntryFilter::Code).unwrap(), 1_000);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    /// The v5 rebuild moves `text_content` to the end of `entries` so row
+    /// metadata never sits behind a huge payload's overflow chain. It rewrites
+    /// the whole table, so every row, id, reference, index, and trigger must
+    /// survive it.
+    #[test]
+    fn migration_v5_moves_payload_last_and_preserves_everything() {
+        let path = temp_db_path();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE entries (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  content_hash TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  mime_type TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  preview_text TEXT,
+                  text_content TEXT,
+                  file_path TEXT, thumb_path TEXT, source_app TEXT,
+                  link_url TEXT, link_domain TEXT, link_icon TEXT,
+                  color_value TEXT, color_format TEXT,
+                  pinned INTEGER NOT NULL DEFAULT 0,
+                  copied_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  last_used_at INTEGER,
+                  use_count INTEGER NOT NULL DEFAULT 0,
+                  size_bytes INTEGER NOT NULL DEFAULT 0,
+                  deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO entries (id, content_hash, kind, mime_type, title, preview_text,
+                                     text_content, pinned, copied_at, updated_at, use_count, size_bytes)
+                VALUES (1, 'h1', 'text', 'text/plain', 'fn main', 'fn main() {}',
+                        'fn main() {\n    println!("hi");\n}', 1, 10, 20, 3, 33),
+                       (2, 'h2', 'image', 'image/png', 'Image', NULL, NULL, 0, 11, 21, 0, 4096),
+                       (3, 'h3', 'text', 'text/plain', 'secret', 'secret', 'hunter2', 0, 12, 22, 0, 7);
+                UPDATE entries SET file_path = '/tmp/i.png' WHERE id = 2;
+                UPDATE entries SET deleted = 1 WHERE id = 3;
+                -- A hard-deleted row once held id 9; ids must never be reused.
+                UPDATE sqlite_sequence SET seq = 9 WHERE name = 'entries';
+
+                CREATE TABLE ocr_results (
+                  entry_id INTEGER PRIMARY KEY, status TEXT NOT NULL, text TEXT, language TEXT,
+                  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                  FOREIGN KEY(entry_id) REFERENCES entries(id)
+                );
+                INSERT INTO ocr_results VALUES (2, 'done', 'receipt total', 'eng', 1, 1);
+                CREATE TABLE secrets (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, source_entry_id INTEGER UNIQUE,
+                  alias TEXT NOT NULL, value TEXT NOT NULL,
+                  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                  FOREIGN KEY(source_entry_id) REFERENCES entries(id)
+                );
+                INSERT INTO secrets (source_entry_id, alias, value, created_at, updated_at)
+                VALUES (3, 'pw', 'hunter2', 1, 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let columns: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('entries')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(columns.last().map(String::as_str), Some("text_content"));
+        assert_eq!(columns.len(), 22);
+
+        let code = db.get_entry(1).unwrap().unwrap();
+        assert!(code.pinned);
+        assert_eq!(
+            (
+                code.copied_at,
+                code.updated_at,
+                code.use_count,
+                code.size_bytes
+            ),
+            (10, 20, 3, 33)
+        );
+        // SQL literals keep `\n` verbatim; the payload must round-trip byte for byte.
+        assert_eq!(
+            code.text_content.as_deref(),
+            Some(r#"fn main() {\n    println!("hi");\n}"#)
+        );
+        assert_eq!(
+            db.get_entry(2).unwrap().unwrap().data,
+            EntryData::Image {
+                file_path: "/tmp/i.png".to_string(),
+                thumb_path: None,
+                ocr_text: Some("receipt total".to_string()),
+            }
+        );
+        assert!(db.get_entry(3).unwrap().is_none(), "soft delete preserved");
+        assert_eq!(db.count_entries("", EntryFilter::Code).unwrap(), 1);
+        assert_eq!(db.count_entries("receipt", EntryFilter::Images).unwrap(), 1);
+
+        // References from other tables still resolve and satisfy foreign keys.
+        let violations: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let fk_enabled: i64 = db
+            .conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_enabled, 1);
+        db.delete_secret(1).unwrap();
+        assert!(
+            db.get_entry(3).unwrap().is_some(),
+            "deleting a secret restores its entry"
+        );
+
+        // Unique hash index, triggers, and the id sequence came back too.
+        let id = db.upsert_entry(&text_entry("h4", "fresh note")).unwrap();
+        assert_eq!(id, 10);
+        assert_eq!(db.count_entries("fresh", EntryFilter::Text).unwrap(), 1);
+        assert_eq!(
+            db.upsert_entry(&text_entry("h4", "fresh note")).unwrap(),
+            id
+        );
+        let plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM entries WHERE deleted = 0 ORDER BY pinned DESC, updated_at DESC LIMIT 5",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_entries_pinned_updated"), "{plan}");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

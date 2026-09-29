@@ -59,6 +59,18 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let id = db.upsert_entry(&entry)?;
+    if config.history.cleanup_unpinned_after_days > 0 {
+        let _ = db.delete_unpinned_older_than_days(config.history.cleanup_unpinned_after_days)?;
+    }
+    if config.links.favicon_cache
+        && let NewEntryData::Link { domain, .. } = &entry.data
+    {
+        favicons::enqueue_domain(&paths, domain)?;
+    }
+    // Announce the entry before auto-OCR: tesseract takes seconds, and the
+    // overlay should list a fresh screenshot immediately, not after OCR.
+    notify_changed(&paths);
+
     if config.ocr.enabled
         && config.ocr.auto_index
         && let NewEntryData::Image {
@@ -72,19 +84,13 @@ pub fn run(args: &[String]) -> Result<()> {
             &config.ocr.command,
             config.ocr.timeout_seconds,
         ) {
-            Ok(text) => db.save_ocr_result(id, &config.ocr.default_language, &text)?,
+            Ok(text) => {
+                db.save_ocr_result(id, &config.ocr.default_language, &text)?;
+                notify_changed(&paths);
+            }
             Err(err) => warn!("auto OCR failed for entry {id}: {err:#}"),
         }
     }
-    if config.history.cleanup_unpinned_after_days > 0 {
-        let _ = db.delete_unpinned_older_than_days(config.history.cleanup_unpinned_after_days)?;
-    }
-    if config.links.favicon_cache
-        && let NewEntryData::Link { domain, .. } = &entry.data
-    {
-        favicons::enqueue_domain(&paths, domain)?;
-    }
-    notify_changed(&paths);
     println!("{id}");
     Ok(())
 }

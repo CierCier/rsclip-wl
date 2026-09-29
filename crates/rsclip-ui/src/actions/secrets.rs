@@ -11,7 +11,8 @@ use crate::actions::refresh::{
 };
 use crate::actions::{set_footer, update_mode_controls};
 use crate::dialogs::secret_alias::prompt_secret_alias;
-use crate::state::{AppState, AppView, current_entry, current_full_entry, current_secret};
+use crate::events::queue_write;
+use crate::state::{AppState, AppView, WriteOp, current_entry, current_full_entry, current_secret};
 
 pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::Window) {
     let Some(entry) = current_full_entry(state) else {
@@ -30,11 +31,14 @@ pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::
         "Save Secret",
         &default_alias,
         move |state, alias| {
-            state.db.transaction(|db| {
-                db.save_secret(Some(entry.id), &alias, &value)?;
-                db.delete_entry(entry.id)?;
-                Ok(())
-            })?;
+            queue_write(
+                state,
+                WriteOp::SaveSecret {
+                    entry_id: entry.id,
+                    alias,
+                    value: value.clone(),
+                },
+            )?;
             *state.view.borrow_mut() = AppView::Secrets;
             *state.query.borrow_mut() = String::new();
             state.search_entry.set_text("");
@@ -60,7 +64,13 @@ pub(crate) fn rename_current_secret_dialog(state: &Rc<AppState>, parent: &gtk::W
         "Rename Secret",
         &secret.alias,
         move |state, alias| {
-            state.db.rename_secret(secret.id, &alias)?;
+            queue_write(
+                state,
+                WriteOp::RenameSecret {
+                    id: secret.id,
+                    alias,
+                },
+            )?;
             refresh_entries_preserving_selection(state)?;
             set_footer(state, "Renamed secret");
             Ok(())
@@ -70,7 +80,13 @@ pub(crate) fn rename_current_secret_dialog(state: &Rc<AppState>, parent: &gtk::W
 
 pub(crate) fn toggle_pin(state: &Rc<AppState>) -> Result<()> {
     let entry = current_entry(state).context("no selected entry")?;
-    state.db.set_pinned(entry.id, !entry.pinned)?;
+    queue_write(
+        state,
+        WriteOp::SetPinned {
+            id: entry.id,
+            pinned: !entry.pinned,
+        },
+    )?;
     refresh_entries_preserving_selection(state)
 }
 
@@ -80,13 +96,13 @@ pub(crate) fn delete_current(state: &Rc<AppState>) -> Result<()> {
     match view {
         AppView::Clipboard => {
             let entry = current_entry(state).context("no selected entry")?;
-            state.db.delete_entry(entry.id)?;
+            queue_write(state, WriteOp::DeleteEntry(entry.id))?;
             refresh_entries_at_index(state, prev_index)?;
         }
         AppView::Secrets => {
             let secret = current_secret(state).context("no selected secret")?;
             let restore_clipboard = secret.source_entry_id.is_some();
-            state.db.delete_secret(secret.id)?;
+            queue_write(state, WriteOp::DeleteSecret(secret.id))?;
             if restore_clipboard {
                 *state.view.borrow_mut() = AppView::Clipboard;
                 *state.query.borrow_mut() = String::new();

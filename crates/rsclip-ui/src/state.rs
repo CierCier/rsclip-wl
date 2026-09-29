@@ -14,6 +14,46 @@ pub(crate) enum AppView {
     Secrets,
 }
 
+/// Identity of a rendered list row: equal keys render identical widgets, so
+/// window shifts can keep those rows instead of rebuilding them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RowKey {
+    view: AppView,
+    id: i64,
+    updated_at: i64,
+    pinned: bool,
+}
+
+impl RowKey {
+    pub(crate) fn entry(entry: &ClipboardEntry) -> Self {
+        Self {
+            view: AppView::Clipboard,
+            id: entry.id,
+            updated_at: entry.updated_at,
+            pinned: entry.pinned,
+        }
+    }
+
+    pub(crate) fn secret(secret: &SecretEntry) -> Self {
+        Self {
+            view: AppView::Secrets,
+            id: secret.id,
+            updated_at: secret.updated_at,
+            pinned: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(id: i64) -> Self {
+        Self {
+            view: AppView::Clipboard,
+            id,
+            updated_at: 0,
+            pinned: false,
+        }
+    }
+}
+
 /// Immutable list parameters sent from GTK to the persistent SQLite worker.
 pub(crate) struct ListRequest {
     pub(crate) generation: u64,
@@ -48,6 +88,66 @@ pub(crate) struct ListResponse {
     pub(crate) result: Result<ListResults, String>,
 }
 
+/// A history/secret write, applied on the list worker's connection.
+///
+/// SQLite rewrites a whole row on UPDATE, so pinning, deleting, or pasting a
+/// legacy 40 MB entry took ~200 ms, and any write could wait out the daemon's
+/// lock (busy_timeout). Running writes on the worker keeps GTK responsive,
+/// and queueing them ahead of the refresh keeps that refresh consistent.
+pub(crate) enum WriteOp {
+    SetPinned {
+        id: i64,
+        pinned: bool,
+    },
+    DeleteEntry(i64),
+    DeleteSecret(i64),
+    SaveSecret {
+        entry_id: i64,
+        alias: String,
+        value: String,
+    },
+    RenameSecret {
+        id: i64,
+        alias: String,
+    },
+    TouchEntry(i64),
+    TouchSecret(i64),
+}
+
+impl WriteOp {
+    pub(crate) fn apply(&self, db: &Database) -> anyhow::Result<()> {
+        match self {
+            Self::SetPinned { id, pinned } => db.set_pinned(*id, *pinned),
+            Self::DeleteEntry(id) => db.delete_entry(*id),
+            Self::DeleteSecret(id) => db.delete_secret(*id),
+            Self::SaveSecret {
+                entry_id,
+                alias,
+                value,
+            } => db.transaction(|db| {
+                db.save_secret(Some(*entry_id), alias, value)?;
+                db.delete_entry(*entry_id)
+            }),
+            Self::RenameSecret { id, alias } => db.rename_secret(*id, alias),
+            Self::TouchEntry(id) => db.touch_used(*id),
+            Self::TouchSecret(id) => db.touch_secret_used(*id),
+        }
+    }
+}
+
+/// Messages to the list worker, processed in order.
+pub(crate) enum WorkerRequest {
+    Write(WriteOp),
+    List(ListRequest),
+}
+
+/// Worker output: the newest list result and/or failures of writes applied
+/// before it (reported after the list renders so its footer cannot hide them).
+pub(crate) struct WorkerResponse {
+    pub(crate) list: Option<ListResponse>,
+    pub(crate) write_error: Option<String>,
+}
+
 /// Persistent preview widget channels. Content is re-filled per selection;
 /// the widget trees themselves are never torn down, so keypresses avoid
 /// widget-tree and Pango-layout rebuild costs.
@@ -67,9 +167,8 @@ pub(crate) struct PreviewChannels {
 pub(crate) struct AppState {
     /// Long-lived connection for writes and explicit full-entry reads.
     pub(crate) db: Database,
-    pub(crate) list_request_tx: mpsc::Sender<ListRequest>,
-    pub(crate) list_response_rx: mpsc::Receiver<ListResponse>,
-    pub(crate) list_response_poll: RefCell<Option<gtk::glib::SourceId>>,
+    pub(crate) list_request_tx: mpsc::Sender<WorkerRequest>,
+    pub(crate) list_response_rx: mpsc::Receiver<WorkerResponse>,
     pub(crate) list_generation: Cell<u64>,
     pub(crate) favicon_icon_dir: PathBuf,
     /// Daemon capture budget (`[history] max_entries`). The daemon never
@@ -97,6 +196,8 @@ pub(crate) struct AppState {
     pub(crate) entries_total: Cell<usize>,
     pub(crate) secrets_total: Cell<usize>,
     pub(crate) pending_selection: Cell<Option<usize>>,
+    /// Keys of the entry/secret rows currently in `list`, in order (spacers excluded).
+    pub(crate) rendered_rows: RefCell<Vec<RowKey>>,
     pub(crate) virtual_list_update: Cell<bool>,
     pub(crate) query: RefCell<String>,
     pub(crate) filter: RefCell<EntryFilter>,
@@ -125,10 +226,6 @@ pub(crate) struct AppState {
 
 /// Invalidate queued and in-flight list work before changing its context.
 pub(crate) fn advance_list_generation(state: &AppState) -> u64 {
-    if let Some(source_id) = state.list_response_poll.borrow_mut().take() {
-        source_id.remove();
-    }
-
     let generation = state.list_generation.get().wrapping_add(1);
     state.list_generation.set(generation);
     generation

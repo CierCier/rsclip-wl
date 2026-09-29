@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -24,17 +24,23 @@ use crate::actions::selection::{
 };
 use crate::actions::{set_footer, update_mode_controls};
 use crate::state::{
-    AppState, AppView, ListRequest, ListResponse, ListResults, current_entry, current_full_entry,
-    current_secret, full_entry_at_row, secret_at_row,
+    AppState, AppView, ListRequest, ListResponse, ListResults, WorkerRequest, WorkerResponse,
+    WriteOp, current_entry, current_full_entry, current_secret, full_entry_at_row, secret_at_row,
 };
 
-/// Delay before applying search so typing does not block the UI on every keystroke.
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(160);
-const LIST_RESULT_POLL: Duration = Duration::from_millis(16);
+/// Delay before applying search so fast typing renders only the final query.
+/// Queries take a few milliseconds and the worker coalesces requests, so this
+/// only needs to cover the gap between keystrokes of a quick burst.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
+
+thread_local! {
+    /// GTK-thread state that list-worker wakeups deliver responses to.
+    static LIST_RESPONSE_TARGET: RefCell<Weak<AppState>> = const { RefCell::new(Weak::new()) };
+}
 
 pub(crate) fn start_list_worker(
     db_path: std::path::PathBuf,
-) -> Result<(mpsc::Sender<ListRequest>, mpsc::Receiver<ListResponse>)> {
+) -> Result<(mpsc::Sender<WorkerRequest>, mpsc::Receiver<WorkerResponse>)> {
     let (request_tx, request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -45,6 +51,8 @@ pub(crate) fn start_list_worker(
 }
 
 pub(crate) fn connect(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
+    LIST_RESPONSE_TARGET.with(|target| *target.borrow_mut() = Rc::downgrade(state));
+    drain_list_responses();
     connect_mode_buttons(state);
     connect_ocr_button(state);
     connect_search(state);
@@ -175,58 +183,82 @@ fn connect_search(state: &Rc<AppState>) {
     });
 }
 
-/// Queue one list query on the persistent worker and watch for its response.
+/// Queue one list query on the persistent worker; its response arrives via
+/// [`drain_list_responses`].
 pub(crate) fn queue_list(state: &Rc<AppState>, request: ListRequest) -> Result<()> {
+    send_to_worker(state, WorkerRequest::List(request))
+}
+
+/// Queue a database write on the worker. It runs before any list request
+/// queued after it, so a following refresh already sees the change.
+pub(crate) fn queue_write(state: &Rc<AppState>, op: WriteOp) -> Result<()> {
+    send_to_worker(state, WorkerRequest::Write(op))
+}
+
+fn send_to_worker(state: &Rc<AppState>, request: WorkerRequest) -> Result<()> {
     state
         .list_request_tx
         .send(request)
-        .map_err(|_| anyhow::anyhow!("list worker stopped"))?;
-    start_list_response_poll(state);
-    Ok(())
+        .map_err(|_| anyhow::anyhow!("list worker stopped"))
 }
 
-/// Poll for worker responses only while a list query is in flight.
-fn start_list_response_poll(state: &Rc<AppState>) {
-    if state.list_response_poll.borrow().is_some() {
-        return;
+/// Send a worker response and wake the GTK main loop to apply it immediately.
+///
+/// A 16 ms poll timer used to add up to a frame of latency to every search
+/// and scroll window; the wakeup runs as soon as the main loop is free.
+fn send_worker_response(
+    response_tx: &mpsc::Sender<WorkerResponse>,
+    response: WorkerResponse,
+) -> bool {
+    if response_tx.send(response).is_err() {
+        return false;
     }
-
-    let poll_state = Rc::clone(state);
-    let source_id = gtk::glib::timeout_add_local(LIST_RESULT_POLL, move || {
-        let mut received_current = false;
-        while let Ok(response) = poll_state.list_response_rx.try_recv() {
-            let matches_gen = response.request.generation == poll_state.list_generation.get();
-            apply_list_response(&poll_state, response);
-            received_current |= matches_gen;
-        }
-
-        if received_current {
-            let _ = poll_state.list_response_poll.borrow_mut().take();
-            gtk::glib::ControlFlow::Break
-        } else {
-            gtk::glib::ControlFlow::Continue
-        }
-    });
-    *state.list_response_poll.borrow_mut() = Some(source_id);
+    gtk::glib::MainContext::default()
+        .invoke_with_priority(gtk::glib::Priority::DEFAULT, drain_list_responses);
+    true
 }
 
-/// Own a dedicated SQLite connection and coalesce queued list requests.
+/// Apply every queued worker response on the GTK thread.
+fn drain_list_responses() {
+    let Some(state) = LIST_RESPONSE_TARGET.with(|target| target.borrow().upgrade()) else {
+        return;
+    };
+    while let Ok(response) = state.list_response_rx.try_recv() {
+        if let Some(list) = response.list {
+            apply_list_response(&state, list);
+        }
+        if let Some(err) = response.write_error {
+            set_footer(&state, &format!("Update failed: {err}"));
+        }
+    }
+}
+
+/// Own a dedicated SQLite connection: apply queued writes in order and run
+/// only the newest queued list request.
 fn list_worker(
     db_path: std::path::PathBuf,
-    request_rx: mpsc::Receiver<ListRequest>,
-    response_tx: mpsc::Sender<ListResponse>,
+    request_rx: mpsc::Receiver<WorkerRequest>,
+    response_tx: mpsc::Sender<WorkerResponse>,
 ) {
     let db = match Database::open(db_path) {
         Ok(db) => db,
         Err(err) => {
+            let err = format!("{err:#}");
             for request in request_rx {
-                if response_tx
-                    .send(ListResponse {
-                        request,
-                        result: Err(format!("{err:#}")),
-                    })
-                    .is_err()
-                {
+                let response = match request {
+                    WorkerRequest::Write(_) => WorkerResponse {
+                        list: None,
+                        write_error: Some(err.clone()),
+                    },
+                    WorkerRequest::List(request) => WorkerResponse {
+                        list: Some(ListResponse {
+                            request,
+                            result: Err(err.clone()),
+                        }),
+                        write_error: None,
+                    },
+                };
+                if !send_worker_response(&response_tx, response) {
                     break;
                 }
             }
@@ -234,14 +266,32 @@ fn list_worker(
         }
     };
 
-    while let Ok(mut request) = request_rx.recv() {
-        // If typing produced several requests before SQLite became available, only
-        // execute the newest one. An in-flight older result is rejected in GTK.
-        while let Ok(newer) = request_rx.try_recv() {
-            request = newer;
+    while let Ok(first) = request_rx.recv() {
+        let mut list_request = None;
+        let mut write_error = None;
+        let mut next = Some(first);
+        while let Some(message) = next {
+            match message {
+                WorkerRequest::Write(op) => {
+                    if let Err(err) = op.apply(&db) {
+                        write_error = Some(format!("{err:#}"));
+                    }
+                }
+                // If typing produced several requests before SQLite became
+                // available, only execute the newest one. An in-flight older
+                // result is rejected in GTK.
+                WorkerRequest::List(request) => list_request = Some(request),
+            }
+            next = request_rx.try_recv().ok();
         }
-        let result = load_list(&db, &request).map_err(|err| format!("{err:#}"));
-        if response_tx.send(ListResponse { request, result }).is_err() {
+
+        let list = list_request.map(|request| {
+            let result = load_list(&db, &request).map_err(|err| format!("{err:#}"));
+            ListResponse { request, result }
+        });
+        if (list.is_some() || write_error.is_some())
+            && !send_worker_response(&response_tx, WorkerResponse { list, write_error })
+        {
             break;
         }
     }
@@ -549,5 +599,87 @@ fn handle_copy(state: &Rc<AppState>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rsclip_core::Database;
+    use rsclip_core::models::{EntryFilter, NewEntry, SortMode};
+
+    use super::{SEARCH_DEBOUNCE, start_list_worker};
+    use crate::components::topbar::SEARCH_ENTRY_DELAY_MS;
+    use crate::state::{AppView, ListRequest, ListResults, WorkerRequest, WriteOp};
+
+    fn list_request(filter: EntryFilter) -> ListRequest {
+        ListRequest {
+            generation: 1,
+            view: AppView::Clipboard,
+            query: String::new(),
+            filter,
+            sort: SortMode::Default,
+            row_limit: 120,
+            requested_start: 0,
+            selected_index: 0,
+            preserve_scroll: false,
+            known_total: None,
+        }
+    }
+
+    /// Writes moved off the GTK thread must still land before the refresh
+    /// queued after them, or pin/delete would render stale lists.
+    #[test]
+    fn worker_applies_writes_before_following_list_request() {
+        let path = std::env::temp_dir().join(format!(
+            "rsclip-ui-worker-test-{}-{:?}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        ));
+        let db = Database::open(&path).unwrap();
+        let mut entry = NewEntry::new("worker-hash".into(), "text/plain".into(), "note".into());
+        entry.text_content = Some("note".into());
+        let id = db.upsert_entry(&entry).unwrap();
+        drop(db);
+
+        let (request_tx, response_rx) = start_list_worker(path.clone()).unwrap();
+        request_tx
+            .send(WorkerRequest::Write(WriteOp::SetPinned {
+                id,
+                pinned: true,
+            }))
+            .unwrap();
+        request_tx
+            .send(WorkerRequest::List(list_request(EntryFilter::Pinned)))
+            .unwrap();
+
+        let response = response_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(response.write_error.is_none());
+        match response.list.unwrap().result.unwrap() {
+            ListResults::Clipboard { total, entries, .. } => {
+                assert_eq!(total, 1);
+                assert_eq!(entries[0].id, id);
+                assert!(entries[0].pinned);
+            }
+            ListResults::Secrets { .. } => panic!("expected clipboard results"),
+        }
+
+        drop(request_tx);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    /// Keystroke-to-query delay: GtkSearchEntry's own delay plus our debounce.
+    /// It once stacked to ~310 ms (150 + 160), which read as laggy search;
+    /// queries themselves take a few milliseconds.
+    #[test]
+    fn perf_search_input_latency_budget() {
+        let latency = Duration::from_millis(SEARCH_ENTRY_DELAY_MS.into()) + SEARCH_DEBOUNCE;
+        assert!(
+            latency <= Duration::from_millis(100),
+            "search waits {latency:?} after the last keystroke"
+        );
     }
 }

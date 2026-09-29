@@ -69,8 +69,11 @@ pub(crate) fn install_change_listener(
                     let _ = refresh_entries(&state);
                 }
             }
-            if favicons_changed && window.is_visible() {
-                rerender_current_list(&state);
+            if favicons_changed {
+                crate::components::list::clear_favicon_cache();
+                if window.is_visible() {
+                    rerender_current_list(&state);
+                }
             }
             gtk::glib::ControlFlow::Continue
         });

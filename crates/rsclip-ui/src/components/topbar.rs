@@ -1,6 +1,10 @@
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+/// GtkSearchEntry delays `search-changed` by 150 ms by default, which stacked
+/// on top of our own debounce; events.rs owns the only delay.
+pub(crate) const SEARCH_ENTRY_DELAY_MS: u32 = 0;
+
 pub(crate) struct Topbar {
     pub(crate) container: gtk::Box,
     pub(crate) history_button: gtk::Button,
@@ -24,6 +28,7 @@ pub(crate) fn build(search_placeholder: &str) -> Topbar {
     container.append(&secrets_button);
 
     let search = gtk::SearchEntry::new();
+    search.set_search_delay(SEARCH_ENTRY_DELAY_MS);
     search.set_placeholder_text(Some(search_placeholder));
     search.add_css_class("search-box");
     search.set_hexpand(true);
