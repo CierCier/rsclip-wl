@@ -25,6 +25,7 @@ pub(crate) struct ListRequest {
     pub(crate) requested_start: usize,
     pub(crate) selected_index: usize,
     pub(crate) preserve_scroll: bool,
+    pub(crate) known_total: Option<usize>,
 }
 
 /// Rows returned by the worker for the active application view.
@@ -95,6 +96,7 @@ pub(crate) struct AppState {
     pub(crate) secrets_start: Cell<usize>,
     pub(crate) entries_total: Cell<usize>,
     pub(crate) secrets_total: Cell<usize>,
+    pub(crate) pending_selection: Cell<Option<usize>>,
     pub(crate) virtual_list_update: Cell<bool>,
     pub(crate) query: RefCell<String>,
     pub(crate) filter: RefCell<EntryFilter>,

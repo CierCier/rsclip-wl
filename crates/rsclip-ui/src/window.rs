@@ -174,6 +174,7 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
         secrets_start: Cell::new(0),
         entries_total: Cell::new(0),
         secrets_total: Cell::new(0),
+        pending_selection: Cell::new(None),
         virtual_list_update: Cell::new(false),
         query: RefCell::new(String::new()),
         filter: RefCell::new(default_filter),

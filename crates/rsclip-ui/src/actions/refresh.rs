@@ -4,10 +4,11 @@ use anyhow::Result;
 use gtk4::prelude::*;
 use rsclip_core::models::{ClipboardEntry, SecretEntry};
 
+use crate::actions::selection::schedule_preview_for_current_selection;
 use crate::actions::set_footer;
 use crate::components::labels::muted_label;
 use crate::components::list::{entry_row, secret_row};
-use crate::components::preview::{clear_preview_state, render_preview, render_secret_preview};
+use crate::components::preview::clear_preview_state;
 use crate::state::{
     AppState, AppView, current_entry_index, current_secret_index, row_index_for_entry,
     row_index_for_secret,
@@ -15,12 +16,13 @@ use crate::state::{
 
 const ESTIMATED_ROW_HEIGHT: f64 = 48.0;
 const MIN_VISIBLE_ROWS: usize = 20;
-// Keep one fallback viewport on each side without rebuilding 100 off-screen rows.
-const WINDOW_PADDING_ROWS: usize = MIN_VISIBLE_ROWS;
+// Keep two full viewports on each side so fast arrow navigation stays within the rendered window.
+const WINDOW_PADDING_ROWS: usize = 50;
 
 pub(crate) fn refresh_entries(state: &Rc<AppState>) -> Result<()> {
+    state.pending_selection.set(None);
     let generation = crate::state::advance_list_generation(state);
-    queue_window(state, generation, 0, 0, false)
+    queue_window(state, generation, 0, 0, false, None)
 }
 
 pub(crate) fn refresh_entries_preserving_selection(state: &Rc<AppState>) -> Result<()> {
@@ -29,6 +31,7 @@ pub(crate) fn refresh_entries_preserving_selection(state: &Rc<AppState>) -> Resu
 }
 
 pub(crate) fn refresh_entries_at_index(state: &Rc<AppState>, target_index: usize) -> Result<()> {
+    state.pending_selection.set(None);
     let generation = crate::state::advance_list_generation(state);
     queue_window(
         state,
@@ -36,6 +39,7 @@ pub(crate) fn refresh_entries_at_index(state: &Rc<AppState>, target_index: usize
         target_index.saturating_sub(WINDOW_PADDING_ROWS),
         target_index,
         true,
+        None,
     )
 }
 
@@ -69,11 +73,14 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
     let current_len = current_len(state);
     let desired_start = first_visible.saturating_sub(WINDOW_PADDING_ROWS);
 
-    let needs_reload = current_len == 0
-        || (first_visible < current_start && current_start > 0)
-        || (first_visible.saturating_add(visible_rows) > current_start.saturating_add(current_len)
-            && current_start.saturating_add(current_len) < total)
-        || desired_start.abs_diff(current_start) >= WINDOW_PADDING_ROWS / 2;
+    // Only reload when approaching the edge of the loaded buffer (within 15 rows)
+    let reload_buffer = 15;
+    let near_top = first_visible < current_start.saturating_add(reload_buffer) && current_start > 0;
+    let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
+        > current_start.saturating_add(current_len)
+        && current_start.saturating_add(current_len) < total;
+
+    let needs_reload = current_len == 0 || near_top || near_bottom;
 
     if !needs_reload {
         return Ok(());
@@ -91,8 +98,15 @@ pub(crate) fn refresh_window_for_scroll(state: &Rc<AppState>) -> Result<()> {
     let selected_index = selected_index(state)
         .filter(|index| *index >= normalized_start && *index < normalized_end)
         .unwrap_or(first_visible);
-    let generation = crate::state::advance_list_generation(state);
-    queue_window(state, generation, normalized_start, selected_index, true)
+    // Crucial: do not advance generation for smooth scroll window shifts.
+    queue_window(
+        state,
+        state.list_generation.get(),
+        normalized_start,
+        selected_index,
+        true,
+        Some(total),
+    )
 }
 
 pub(crate) fn ensure_row_rendered(state: &Rc<AppState>, index: usize) -> Result<()> {
@@ -102,13 +116,15 @@ pub(crate) fn ensure_row_rendered(state: &Rc<AppState>, index: usize) -> Result<
         return Ok(());
     }
 
-    let generation = crate::state::advance_list_generation(state);
+    // Do not advance generation: navigating past window edge should not invalidate
+    // or discard in-flight list responses.
     queue_window(
         state,
-        generation,
+        state.list_generation.get(),
         index.saturating_sub(WINDOW_PADDING_ROWS),
         index,
         true,
+        Some(current_total(state)),
     )
 }
 
@@ -118,6 +134,7 @@ fn queue_window(
     requested_start: usize,
     selected_index: usize,
     preserve_scroll: bool,
+    known_total: Option<usize>,
 ) -> Result<()> {
     let query = state.query.borrow().clone();
     let filter = *state.filter.borrow();
@@ -143,6 +160,7 @@ fn queue_window(
             requested_start,
             selected_index,
             preserve_scroll,
+            known_total,
         },
     )
 }
@@ -161,7 +179,8 @@ pub(crate) fn apply_clipboard_search_results(
     *state.entries.borrow_mut() = entries;
     state.entries_start.set(start);
     state.entries_total.set(total);
-    render_clipboard_window(state, Some(request.selected_index), request.preserve_scroll);
+    let selected_index = state.pending_selection.take().or(Some(request.selected_index));
+    render_clipboard_window(state, selected_index, request.preserve_scroll);
 }
 
 /// Replace the visible secrets window with a completed worker result.
@@ -178,7 +197,8 @@ pub(crate) fn apply_secret_search_results(
     *state.secrets.borrow_mut() = secrets;
     state.secrets_start.set(start);
     state.secrets_total.set(total);
-    render_secrets_window(state, Some(request.selected_index), request.preserve_scroll);
+    let selected_index = state.pending_selection.take().or(Some(request.selected_index));
+    render_secrets_window(state, selected_index, request.preserve_scroll);
 }
 
 fn render_clipboard_window(
@@ -304,10 +324,7 @@ fn select_clipboard_row(state: &Rc<AppState>, selected_index: Option<usize>) {
         && let Some(row) = state.list.row_at_index(row_index)
     {
         state.list.select_row(Some(&row));
-        let relative_index = selected_index.saturating_sub(state.entries_start.get());
-        if let Some(entry) = state.entries.borrow().get(relative_index) {
-            render_preview(state, entry);
-        }
+        schedule_preview_for_current_selection(state);
     }
 }
 
@@ -335,10 +352,7 @@ fn select_secret_row(state: &Rc<AppState>, selected_index: Option<usize>) {
         && let Some(row) = state.list.row_at_index(row_index)
     {
         state.list.select_row(Some(&row));
-        let relative_index = selected_index.saturating_sub(state.secrets_start.get());
-        if let Some(secret) = state.secrets.borrow().get(relative_index) {
-            render_secret_preview(state, secret);
-        }
+        schedule_preview_for_current_selection(state);
     }
 }
 
@@ -539,7 +553,7 @@ mod tests {
 
     #[test]
     fn result_window_is_bounded_for_large_history() {
-        assert_eq!(window_row_count_for(20, usize::MAX), 60);
+        assert_eq!(window_row_count_for(20, usize::MAX), 120);
     }
 
     #[test]
@@ -583,5 +597,29 @@ mod tests {
         assert_eq!(clamp_window_index(0, 9, 9, Some(5)), Some(5));
         // Deleting the only remaining item -> total is 0.
         assert_eq!(clamp_window_index(0, 0, 0, Some(0)), None);
+    }
+
+    #[test]
+    fn scroll_within_window_buffer_does_not_trigger_reload() {
+        let current_start: usize = 0;
+        let current_len: usize = 120;
+        let total: usize = 5000;
+        let visible_rows: usize = 20;
+        let reload_buffer: usize = 15;
+
+        for first_visible in 0usize..=80 {
+            let near_top = first_visible < current_start.saturating_add(reload_buffer) && current_start > 0;
+            let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
+                > current_start.saturating_add(current_len)
+                && current_start.saturating_add(current_len) < total;
+            let needs_reload = current_len == 0 || near_top || near_bottom;
+            assert!(!needs_reload, "Unnecessary reload at first_visible = {first_visible}");
+        }
+
+        let first_visible: usize = 90;
+        let near_bottom = first_visible.saturating_add(visible_rows).saturating_add(reload_buffer)
+            > current_start.saturating_add(current_len)
+            && current_start.saturating_add(current_len) < total;
+        assert!(near_bottom, "Expected reload when approaching bottom boundary");
     }
 }

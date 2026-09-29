@@ -61,27 +61,30 @@ pub(crate) fn move_selection(state: &Rc<AppState>, delta: i32) {
         AppView::Secrets => state.secrets_total.get(),
     };
 
-    let current = match *state.view.borrow() {
-        AppView::Clipboard => current_entry_index(state),
-        AppView::Secrets => current_secret_index(state),
-    };
+    let current = state
+        .pending_selection
+        .get()
+        .or_else(|| match *state.view.borrow() {
+            AppView::Clipboard => current_entry_index(state),
+            AppView::Secrets => current_secret_index(state),
+        });
 
     let Some(next) = next_selection_index(current, delta, count) else {
         return;
     };
 
-    if let Err(err) = ensure_row_rendered(state, next) {
-        set_footer(state, &format!("Selection failed: {err:#}"));
-        return;
-    }
+    state.pending_selection.set(Some(next));
 
     let row_index = match *state.view.borrow() {
         AppView::Clipboard => row_index_for_entry(state, next),
         AppView::Secrets => row_index_for_secret(state, next),
     };
     if let Some(row) = row_index.and_then(|index| state.list.row_at_index(index)) {
+        state.pending_selection.set(None);
         state.list.select_row(Some(&row));
         scroll_row_into_view(state, &row);
+    } else if let Err(err) = ensure_row_rendered(state, next) {
+        set_footer(state, &format!("Selection failed: {err:#}"));
     }
 }
 

@@ -163,6 +163,7 @@ fn connect_search(state: &Rc<AppState>) {
                 requested_start: 0,
                 selected_index: 0,
                 preserve_scroll: false,
+                known_total: None,
             };
             if queue_list(&state, request).is_err() {
                 set_footer(&state, "List worker stopped");
@@ -176,31 +177,30 @@ fn connect_search(state: &Rc<AppState>) {
 
 /// Queue one list query on the persistent worker and watch for its response.
 pub(crate) fn queue_list(state: &Rc<AppState>, request: ListRequest) -> Result<()> {
-    let generation = request.generation;
     state
         .list_request_tx
         .send(request)
         .map_err(|_| anyhow::anyhow!("list worker stopped"))?;
-    start_list_response_poll(state, generation);
+    start_list_response_poll(state);
     Ok(())
 }
 
-/// Poll for one expected worker response only while a list query is in flight.
-fn start_list_response_poll(state: &Rc<AppState>, expected_generation: u64) {
-    if let Some(source_id) = state.list_response_poll.borrow_mut().take() {
-        source_id.remove();
+/// Poll for worker responses only while a list query is in flight.
+fn start_list_response_poll(state: &Rc<AppState>) {
+    if state.list_response_poll.borrow().is_some() {
+        return;
     }
 
-    let state = Rc::clone(state);
-    let poll_state = Rc::clone(&state);
+    let poll_state = Rc::clone(state);
     let source_id = gtk::glib::timeout_add_local(LIST_RESULT_POLL, move || {
-        let mut received_expected = false;
+        let mut received_current = false;
         while let Ok(response) = poll_state.list_response_rx.try_recv() {
-            received_expected |= response.request.generation == expected_generation;
+            let matches_gen = response.request.generation == poll_state.list_generation.get();
             apply_list_response(&poll_state, response);
+            received_current |= matches_gen;
         }
 
-        if received_expected {
+        if received_current {
             let _ = poll_state.list_response_poll.borrow_mut().take();
             gtk::glib::ControlFlow::Break
         } else {
@@ -255,7 +255,10 @@ fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults
             // daemon, not a hard history bound — nothing prunes to it. Do not
             // clamp the count here: the UI must show the real total and let
             // the user navigate everything that exists.
-            let total = db.count_entries(&request.query, request.filter)?;
+            let total = match request.known_total {
+                Some(total) => total,
+                None => db.count_entries(&request.query, request.filter)?,
+            };
             let window_len = request.row_limit.min(total);
             let start = request
                 .requested_start
@@ -278,7 +281,10 @@ fn load_list(db: &Database, request: &ListRequest) -> anyhow::Result<ListResults
             }
         }
         AppView::Secrets => {
-            let total = db.count_secrets(&request.query)?;
+            let total = match request.known_total {
+                Some(total) => total,
+                None => db.count_secrets(&request.query)?,
+            };
             let window_len = request.row_limit.min(total);
             let start = request
                 .requested_start

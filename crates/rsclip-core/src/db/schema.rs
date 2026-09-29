@@ -4,7 +4,7 @@ use rusqlite::params;
 use super::Database;
 
 /// Highest applied schema version. Add a new `if current < N` step when changing schema.
-const SCHEMA_USER_VERSION: i32 = 1;
+const SCHEMA_USER_VERSION: i32 = 3;
 
 impl Database {
     pub fn migrate(&self) -> Result<()> {
@@ -19,9 +19,40 @@ impl Database {
         if current < 1 {
             self.migrate_v1()?;
         }
+        if current < 2 {
+            self.migrate_v2()?;
+        }
+        if current < 3 {
+            self.migrate_v3()?;
+        }
 
         self.conn
             .pragma_update(None, "user_version", SCHEMA_USER_VERSION)?;
+        Ok(())
+    }
+
+    /// Performance covering indexes for all SortMode variants (Type, MostUsed) and kind filtering.
+    fn migrate_v3(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_entries_kind_pinned_updated ON entries(deleted, kind, pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_type_sort ON entries(deleted, kind ASC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_most_used ON entries(deleted, use_count DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_kind_used ON entries(deleted, kind, use_count DESC, updated_at DESC);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// Performance indexes for recent and pinned sorting without table scans.
+    fn migrate_v2(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_entries_updated_at ON entries(deleted, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_pinned_updated ON entries(deleted, pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_secrets_updated_at ON secrets(deleted, updated_at DESC);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -114,6 +145,13 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_hash ON entries(content_hash);
             CREATE INDEX IF NOT EXISTS idx_entries_copied_at ON entries(copied_at DESC);
             CREATE INDEX IF NOT EXISTS idx_entries_pinned ON entries(pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_updated_at ON entries(deleted, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_pinned_updated ON entries(deleted, pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_kind_pinned_updated ON entries(deleted, kind, pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_type_sort ON entries(deleted, kind ASC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_most_used ON entries(deleted, use_count DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_entries_kind_used ON entries(deleted, kind, use_count DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_secrets_updated_at ON secrets(deleted, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_entries_kind ON entries(kind);
             CREATE INDEX IF NOT EXISTS idx_entries_domain ON entries(link_domain);
 

@@ -3,9 +3,10 @@ use std::path::Path;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use rsclip_core::favicons::domain_cache_key;
-use rsclip_core::files::parse_uri_list;
+use rsclip_core::files::parse_uri_list_bounded;
 use rsclip_core::format::relative_time;
 use rsclip_core::models::{ClipboardEntry, EntryData, EntryKind, SecretEntry};
+use rsclip_core::syntax::CodeLanguage;
 
 const FAVICON_SLOT_SIZE: i32 = 28;
 const FAVICON_SIZE: i32 = 20;
@@ -46,7 +47,8 @@ pub(crate) fn entry_row(entry: &ClipboardEntry, favicon_icon_dir: &Path) -> gtk:
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     outer.add_css_class("entry-row-content");
     outer.set_hexpand(true);
-    let icon = entry_icon(entry, favicon_icon_dir);
+    let lang = detect_entry_language(entry);
+    let icon = entry_icon(entry, favicon_icon_dir, lang);
     outer.append(&icon);
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -57,7 +59,7 @@ pub(crate) fn entry_row(entry: &ClipboardEntry, favicon_icon_dir: &Path) -> gtk:
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     text.append(&title);
 
-    let subtitle = gtk::Label::new(Some(&subtitle(entry)));
+    let subtitle = gtk::Label::new(Some(&subtitle(entry, lang)));
     subtitle.add_css_class("entry-subtitle");
     subtitle.set_xalign(0.0);
     subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -134,11 +136,15 @@ fn badge_icon(glyph: &str, tooltip: &str) -> gtk::Widget {
     badge.upcast()
 }
 
-fn entry_icon(entry: &ClipboardEntry, favicon_icon_dir: &Path) -> gtk::Widget {
+fn entry_icon(
+    entry: &ClipboardEntry,
+    favicon_icon_dir: &Path,
+    lang: Option<CodeLanguage>,
+) -> gtk::Widget {
     match &entry.data {
         EntryData::Link { domain, .. } => link_icon(favicon_icon_dir, domain),
         _ => {
-            let (glyph, color, tooltip) = resolved_entry_nerd_icon_and_label(entry);
+            let (glyph, color, tooltip) = resolved_entry_nerd_icon_and_label(entry, lang);
             nerd_icon(glyph, color.as_deref(), &tooltip)
         }
     }
@@ -188,20 +194,41 @@ fn domain_tooltip(domain: &str) -> &str {
     if domain.is_empty() { "Link" } else { domain }
 }
 
+fn detect_entry_language(entry: &ClipboardEntry) -> Option<CodeLanguage> {
+    if entry.kind != EntryKind::Text {
+        return None;
+    }
+    let sample = entry
+        .preview_text
+        .as_deref()
+        .or(entry.text_content.as_deref())
+        .unwrap_or("");
+    if sample.is_empty() {
+        return None;
+    }
+    // Bound the sample scanned to at most 4KB so detection never stalls on huge text
+    let bounded = if sample.len() > 4096 {
+        let mut end = 4096;
+        while !sample.is_char_boundary(end) {
+            end -= 1;
+        }
+        &sample[..end]
+    } else {
+        sample
+    };
+    rsclip_core::syntax::detect_code_language(bounded)
+}
+
 fn resolved_entry_nerd_icon_and_label(
     entry: &ClipboardEntry,
+    lang: Option<CodeLanguage>,
 ) -> (&'static str, Option<String>, String) {
     match &entry.data {
         EntryData::Color { value, .. } => ("\u{f53f}", Some(value.clone()), "Color".to_string()),
         EntryData::File { .. } => ("\u{f07b}", Some("#79b8ff".to_string()), "File".to_string()),
         EntryData::Image { .. } => ("\u{f03e}", Some("#85e89d".to_string()), "Image".to_string()),
         EntryData::Text | EntryData::Unknown => {
-            let sample = entry
-                .preview_text
-                .as_deref()
-                .or(entry.text_content.as_deref())
-                .unwrap_or("");
-            if let Some(lang) = rsclip_core::syntax::detect_code_language(sample) {
+            if let Some(lang) = lang {
                 (
                     lang.nerd_icon(),
                     Some(lang.nerd_color().to_string()),
@@ -217,7 +244,7 @@ fn resolved_entry_nerd_icon_and_label(
     }
 }
 
-fn subtitle(entry: &ClipboardEntry) -> String {
+fn subtitle(entry: &ClipboardEntry, lang: Option<CodeLanguage>) -> String {
     if let EntryData::File { .. } = &entry.data
         && let Some(subtitle) = file_subtitle(entry)
     {
@@ -226,12 +253,7 @@ fn subtitle(entry: &ClipboardEntry) -> String {
 
     let time = relative_time(entry.updated_at);
     if entry.kind == EntryKind::Text {
-        let sample = entry
-            .preview_text
-            .as_deref()
-            .or(entry.text_content.as_deref())
-            .unwrap_or("");
-        if let Some(lang) = rsclip_core::syntax::detect_code_language(sample) {
+        if let Some(lang) = lang {
             return format!("{time} • {}", lang.display_name());
         }
     }
@@ -240,15 +262,18 @@ fn subtitle(entry: &ClipboardEntry) -> String {
 }
 
 fn file_subtitle(entry: &ClipboardEntry) -> Option<String> {
-    let files = parse_uri_list(entry.text_content.as_deref()?);
-    if files.is_empty() {
+    let payload = entry
+        .text_content
+        .as_deref()
+        .or(entry.preview_text.as_deref())?;
+    let bounded = parse_uri_list_bounded(payload, 50, 4096);
+    if bounded.files.is_empty() {
         return None;
     }
 
-    let missing = files.iter().filter(|file| !file.path.exists()).count();
-    let mut subtitle = file_count_label(files.len());
-    if missing > 0 {
-        subtitle.push_str(&format!(", {missing} missing"));
+    let mut subtitle = file_count_label(bounded.files.len());
+    if bounded.truncated {
+        subtitle.push('+');
     }
     Some(subtitle)
 }
@@ -287,23 +312,25 @@ mod tests {
     #[test]
     fn text_entry_with_code_resolves_language_icon_and_label() {
         let entry = test_entry(1, "fn main() {\n    println!(\"hi\");\n}");
-        let (glyph, color, label) = resolved_entry_nerd_icon_and_label(&entry);
+        let lang = detect_entry_language(&entry);
+        let (glyph, color, label) = resolved_entry_nerd_icon_and_label(&entry, lang);
         assert_eq!(label, "Rust");
         assert_eq!(glyph, "\u{e7a8}");
         assert!(color.is_some());
 
-        let sub = subtitle(&entry);
+        let sub = subtitle(&entry, lang);
         assert!(sub.contains("Rust"));
     }
 
     #[test]
     fn plain_text_entry_resolves_text_icon_and_label() {
         let entry = test_entry(2, "Meeting at 3pm today with Alice");
-        let (glyph, _color, label) = resolved_entry_nerd_icon_and_label(&entry);
+        let lang = detect_entry_language(&entry);
+        let (glyph, _color, label) = resolved_entry_nerd_icon_and_label(&entry, lang);
         assert_eq!(label, "Text");
         assert_eq!(glyph, "\u{f0219}");
 
-        let sub = subtitle(&entry);
+        let sub = subtitle(&entry, lang);
         assert!(!sub.contains("•"));
     }
 }

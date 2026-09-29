@@ -21,6 +21,10 @@ impl Database {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "cache_size", -64000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         register_sqlite_functions(&conn)?;
         let db = Self { conn };
@@ -34,6 +38,11 @@ impl Database {
         let value = f(self)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Access the underlying SQLite connection for profiling, diagnostics, or benchmarks.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
     }
 }
 
@@ -608,6 +617,132 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "old");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn query_plans_use_indexes_without_temp_btree_for_all_sort_modes() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+
+        // 1. Default sort (pinned DESC, updated_at DESC)
+        {
+            let mut stmt = db
+                .conn
+                .prepare("EXPLAIN QUERY PLAN SELECT e.id FROM entries e WHERE e.deleted = 0 ORDER BY e.pinned DESC, e.updated_at DESC LIMIT 50 OFFSET 0")
+                .unwrap();
+            let plan_rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan_rows.join("\n");
+            assert!(!plan.contains("USE TEMP B-TREE"), "Default sort plan used temp b-tree: {plan}");
+            assert!(
+                plan.contains("idx_entries_pinned_updated") || plan.contains("idx_entries_pinned"),
+                "Default sort plan did not use index: {plan}"
+            );
+        }
+
+        // 2. Recent sort (updated_at DESC)
+        {
+            let mut stmt = db
+                .conn
+                .prepare("EXPLAIN QUERY PLAN SELECT e.id FROM entries e WHERE e.deleted = 0 ORDER BY e.updated_at DESC LIMIT 50 OFFSET 0")
+                .unwrap();
+            let plan_rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan_rows.join("\n");
+            assert!(!plan.contains("USE TEMP B-TREE"), "Recent sort plan used temp b-tree: {plan}");
+            assert!(plan.contains("idx_entries_updated_at"), "Recent sort plan did not use index: {plan}");
+        }
+
+        // 3. Type sort (kind ASC, updated_at DESC)
+        {
+            let mut stmt = db
+                .conn
+                .prepare("EXPLAIN QUERY PLAN SELECT e.id FROM entries e WHERE e.deleted = 0 ORDER BY e.kind ASC, e.updated_at DESC LIMIT 50 OFFSET 0")
+                .unwrap();
+            let plan_rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan_rows.join("\n");
+            assert!(!plan.contains("USE TEMP B-TREE"), "Type sort plan used temp b-tree: {plan}");
+            assert!(plan.contains("idx_entries_type_sort"), "Type sort plan did not use index: {plan}");
+        }
+
+        // 4. MostUsed sort (use_count DESC, updated_at DESC)
+        {
+            let mut stmt = db
+                .conn
+                .prepare("EXPLAIN QUERY PLAN SELECT e.id FROM entries e WHERE e.deleted = 0 ORDER BY e.use_count DESC, e.updated_at DESC LIMIT 50 OFFSET 0")
+                .unwrap();
+            let plan_rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan_rows.join("\n");
+            assert!(!plan.contains("USE TEMP B-TREE"), "MostUsed sort plan used temp b-tree: {plan}");
+            assert!(plan.contains("idx_entries_most_used"), "MostUsed sort plan did not use index: {plan}");
+        }
+
+        // 5. Kind filter with MostUsed sort (use_count DESC, updated_at DESC)
+        {
+            let mut stmt = db
+                .conn
+                .prepare("EXPLAIN QUERY PLAN SELECT e.id FROM entries e WHERE e.deleted = 0 AND e.kind = 'image' ORDER BY e.use_count DESC, e.updated_at DESC LIMIT 50 OFFSET 0")
+                .unwrap();
+            let plan_rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan_rows.join("\n");
+            assert!(!plan.contains("USE TEMP B-TREE"), "Kind + MostUsed sort plan used temp b-tree: {plan}");
+            assert!(plan.contains("idx_entries_kind_used"), "Kind + MostUsed sort plan did not use index: {plan}");
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[test]
+    fn search_with_huge_payload_stays_bounded_in_time() {
+        let path = temp_db_path();
+        let db = Database::open(&path).unwrap();
+
+        let huge_text = "a".repeat(2 * 1024 * 1024);
+        db.conn
+            .execute(
+                r#"
+                INSERT INTO entries (
+                  content_hash, kind, mime_type, title, preview_text, text_content,
+                  copied_at, updated_at, size_bytes
+                )
+                VALUES ('huge-hash', 'text', 'text/plain', 'huge-title', 'huge-preview', ?1, 100, 100, ?2)
+                "#,
+                rusqlite::params![huge_text, huge_text.len() as i64],
+            )
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let count = db.count_entries("nonexistent-needle", EntryFilter::All).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 0);
+        assert!(elapsed < std::time::Duration::from_millis(100), "Search took too long: {elapsed:?}");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

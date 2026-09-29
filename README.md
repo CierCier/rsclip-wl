@@ -300,6 +300,6 @@ rsclipd favicons refresh    # re-queue favicon fetches for all link domains in h
 
 ## Release and AUR
 
-Build the release archive locally with `./scripts/build-release-archive.sh 0.1.20`.
-Pushing a matching `v0.1.20` tag runs the release workflow, publishes the archive,
+Build the release archive locally with `./scripts/build-release-archive.sh 0.1.21`.
+Pushing a matching `v0.1.21` tag runs the release workflow, publishes the archive,
 and updates the `rsclip-bin` AUR package.
