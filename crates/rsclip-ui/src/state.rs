@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use anyhow::Context;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use rsclip_core::Database;
 use rsclip_core::models::{ClipboardEntry, EntryFilter, SecretEntry, SortMode};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum AppView {
     Clipboard,
     Secrets,
@@ -16,7 +17,7 @@ pub(crate) enum AppView {
 
 /// Identity of a rendered list row: equal keys render identical widgets, so
 /// window shifts can keep those rows instead of rebuilding them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RowKey {
     view: AppView,
     id: i64,
@@ -101,16 +102,16 @@ pub(crate) enum WriteOp {
     },
     DeleteEntry(i64),
     DeleteSecret(i64),
+    /// Save an entry's text as a secret. The worker reads the full payload,
+    /// which for a legacy multi-megabyte row took 100+ ms on the GTK thread.
     SaveSecret {
         entry_id: i64,
         alias: String,
-        value: String,
     },
     RenameSecret {
         id: i64,
         alias: String,
     },
-    TouchEntry(i64),
     TouchSecret(i64),
 }
 
@@ -120,31 +121,56 @@ impl WriteOp {
             Self::SetPinned { id, pinned } => db.set_pinned(*id, *pinned),
             Self::DeleteEntry(id) => db.delete_entry(*id),
             Self::DeleteSecret(id) => db.delete_secret(*id),
-            Self::SaveSecret {
-                entry_id,
-                alias,
-                value,
-            } => db.transaction(|db| {
-                db.save_secret(Some(*entry_id), alias, value)?;
-                db.delete_entry(*entry_id)
-            }),
+            Self::SaveSecret { entry_id, alias } => {
+                let entry = db.get_entry(*entry_id)?.context("entry no longer exists")?;
+                let value = rsclip_core::secrets::secret_value_from_entry(&entry)
+                    .context("only text-like entries can be saved as secrets")?;
+                db.transaction(|db| {
+                    db.save_secret(Some(*entry_id), alias, &value)?;
+                    db.delete_entry(*entry_id)
+                })
+            }
             Self::RenameSecret { id, alias } => db.rename_secret(*id, alias),
-            Self::TouchEntry(id) => db.touch_used(*id),
             Self::TouchSecret(id) => db.touch_secret_used(*id),
         }
     }
+}
+
+/// What the GTK thread does once the worker finished copying an entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AfterCopy {
+    /// Close the overlay and paste (Enter, row activation).
+    Paste,
+    /// Keep the overlay open and report the copy in the footer (Ctrl+C).
+    Report,
 }
 
 /// Messages to the list worker, processed in order.
 pub(crate) enum WorkerRequest {
     Write(WriteOp),
     List(ListRequest),
+    /// Read an entry's full payload, hand it to `wl-copy`, and mark it used.
+    ///
+    /// Both steps scale with the payload: reading a legacy 40 MB row took
+    /// ~140 ms and piping it to `wl-copy` more, all of it on the GTK thread.
+    CopyEntry {
+        id: i64,
+        then: AfterCopy,
+    },
 }
 
-/// Worker output: the newest list result and/or failures of writes applied
-/// before it (reported after the list renders so its footer cannot hide them).
+/// Result of a [`WorkerRequest::CopyEntry`].
+pub(crate) struct CopyResponse {
+    pub(crate) then: AfterCopy,
+    pub(crate) result: Result<(), String>,
+}
+
+/// Worker output: the newest list result, finished copies, and/or failures of
+/// writes applied before them (reported after the list renders so its footer
+/// cannot hide them).
 pub(crate) struct WorkerResponse {
     pub(crate) list: Option<ListResponse>,
+    pub(crate) copies: Vec<CopyResponse>,
     pub(crate) write_error: Option<String>,
 }
 
@@ -237,12 +263,6 @@ pub(crate) fn current_entry(state: &Rc<AppState>) -> Option<ClipboardEntry> {
     entry_at_row(state, &row)
 }
 
-/// Load the complete selected entry for actions that consume its clipboard payload.
-pub(crate) fn current_full_entry(state: &Rc<AppState>) -> Option<ClipboardEntry> {
-    let row = state.list.selected_row()?;
-    full_entry_at_row(state, &row)
-}
-
 pub(crate) fn current_secret(state: &Rc<AppState>) -> Option<SecretEntry> {
     let row = state.list.selected_row()?;
     secret_at_row(state, &row)
@@ -262,15 +282,6 @@ pub(crate) fn entry_at_row(state: &Rc<AppState>, row: &gtk::ListBoxRow) -> Optio
     let relative_index =
         row_relative_index(row, state.entries_start.get(), state.entries.borrow().len())?;
     state.entries.borrow().get(relative_index).cloned()
-}
-
-/// Load the complete entry represented by `row`.
-pub(crate) fn full_entry_at_row(
-    state: &Rc<AppState>,
-    row: &gtk::ListBoxRow,
-) -> Option<ClipboardEntry> {
-    let id = entry_at_row(state, row)?.id;
-    state.db.get_entry(id).ok().flatten()
 }
 
 pub(crate) fn secret_at_row(state: &Rc<AppState>, row: &gtk::ListBoxRow) -> Option<SecretEntry> {

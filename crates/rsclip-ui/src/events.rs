@@ -10,7 +10,9 @@ use gtk4 as gtk;
 use rsclip_core::Database;
 use rsclip_core::models::{EntryFilter, EntryKind};
 
-use crate::actions::clipboard::{copy_secret, copy_selected_entry};
+use crate::actions::clipboard::{
+    copy_entry_by_id, copy_secret, finish_entry_copy, queue_entry_copy,
+};
 use crate::actions::ocr::run_ocr_for_entry;
 use crate::actions::refresh::{
     apply_clipboard_search_results, apply_secret_search_results, refresh_entries,
@@ -24,8 +26,9 @@ use crate::actions::selection::{
 };
 use crate::actions::{set_footer, update_mode_controls};
 use crate::state::{
-    AppState, AppView, ListRequest, ListResponse, ListResults, WorkerRequest, WorkerResponse,
-    WriteOp, current_entry, current_full_entry, current_secret, full_entry_at_row, secret_at_row,
+    AfterCopy, AppState, AppView, CopyResponse, ListRequest, ListResponse, ListResults,
+    WorkerRequest, WorkerResponse, WriteOp, current_entry, current_secret, entry_at_row,
+    secret_at_row,
 };
 
 /// Delay before applying search so fast typing renders only the final query.
@@ -195,7 +198,7 @@ pub(crate) fn queue_write(state: &Rc<AppState>, op: WriteOp) -> Result<()> {
     send_to_worker(state, WorkerRequest::Write(op))
 }
 
-fn send_to_worker(state: &Rc<AppState>, request: WorkerRequest) -> Result<()> {
+pub(crate) fn send_to_worker(state: &Rc<AppState>, request: WorkerRequest) -> Result<()> {
     state
         .list_request_tx
         .send(request)
@@ -227,6 +230,9 @@ fn drain_list_responses() {
         if let Some(list) = response.list {
             apply_list_response(&state, list);
         }
+        for copy in response.copies {
+            finish_entry_copy(&state, copy);
+        }
         if let Some(err) = response.write_error {
             set_footer(&state, &format!("Update failed: {err}"));
         }
@@ -248,6 +254,7 @@ fn list_worker(
                 let response = match request {
                     WorkerRequest::Write(_) => WorkerResponse {
                         list: None,
+                        copies: Vec::new(),
                         write_error: Some(err.clone()),
                     },
                     WorkerRequest::List(request) => WorkerResponse {
@@ -255,6 +262,15 @@ fn list_worker(
                             request,
                             result: Err(err.clone()),
                         }),
+                        copies: Vec::new(),
+                        write_error: None,
+                    },
+                    WorkerRequest::CopyEntry { then, .. } => WorkerResponse {
+                        list: None,
+                        copies: vec![CopyResponse {
+                            then,
+                            result: Err(err.clone()),
+                        }],
                         write_error: None,
                     },
                 };
@@ -268,6 +284,7 @@ fn list_worker(
 
     while let Ok(first) = request_rx.recv() {
         let mut list_request = None;
+        let mut copies = Vec::new();
         let mut write_error = None;
         let mut next = Some(first);
         while let Some(message) = next {
@@ -281,6 +298,15 @@ fn list_worker(
                 // available, only execute the newest one. An in-flight older
                 // result is rejected in GTK.
                 WorkerRequest::List(request) => list_request = Some(request),
+                WorkerRequest::CopyEntry { id, then } => {
+                    let result = copy_entry_by_id(&db, id).map_err(|err| format!("{err:#}"));
+                    if result.is_ok()
+                        && let Err(err) = db.touch_used(id)
+                    {
+                        write_error = Some(format!("{err:#}"));
+                    }
+                    copies.push(CopyResponse { then, result });
+                }
             }
             next = request_rx.try_recv().ok();
         }
@@ -289,8 +315,15 @@ fn list_worker(
             let result = load_list(&db, &request).map_err(|err| format!("{err:#}"));
             ListResponse { request, result }
         });
-        if (list.is_some() || write_error.is_some())
-            && !send_worker_response(&response_tx, WorkerResponse { list, write_error })
+        let response = WorkerResponse {
+            list,
+            copies,
+            write_error,
+        };
+        if (response.list.is_some()
+            || !response.copies.is_empty()
+            || response.write_error.is_some())
+            && !send_worker_response(&response_tx, response)
         {
             break;
         }
@@ -399,8 +432,8 @@ fn connect_filter(state: &Rc<AppState>) {
 fn connect_list_selection(state: &Rc<AppState>) {
     let list = state.list.clone();
     let state = Rc::clone(state);
-    list.connect_row_selected(move |list, row| {
-        mark_selected_row(list, row);
+    list.connect_row_selected(move |_, row| {
+        mark_selected_row(row);
         // Window rebuilds already render the preview directly via
         // select_*_row; skipping here avoids a second sync DB read and
         // TextView layout per rebuild.
@@ -419,12 +452,10 @@ fn connect_list_activation(state: &Rc<AppState>, window: &gtk::ApplicationWindow
     let window = window.clone();
     list.connect_row_activated(move |_, row| match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = full_entry_at_row(&state, row) {
-                if let Err(err) = copy_selected_entry(&state, &entry) {
-                    set_footer(&state, &format!("Paste failed: {err:#}"));
-                    return;
-                }
-                crate::window::close_overlay_and_paste(&state, &window);
+            if let Some(entry) = entry_at_row(&state, row)
+                && let Err(err) = queue_entry_copy(&state, entry.id, AfterCopy::Paste)
+            {
+                set_footer(&state, &format!("Paste failed: {err:#}"));
             }
         }
         AppView::Secrets => {
@@ -559,12 +590,10 @@ fn set_filter(state: &Rc<AppState>, filter: EntryFilter) {
 fn handle_enter(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
     match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = current_full_entry(state) {
-                if let Err(err) = copy_selected_entry(state, &entry) {
-                    set_footer(state, &format!("Paste failed: {err:#}"));
-                } else {
-                    crate::window::close_overlay_and_paste(state, window);
-                }
+            if let Some(entry) = current_entry(state)
+                && let Err(err) = queue_entry_copy(state, entry.id, AfterCopy::Paste)
+            {
+                set_footer(state, &format!("Paste failed: {err:#}"));
             }
         }
         AppView::Secrets => {
@@ -582,12 +611,10 @@ fn handle_enter(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
 fn handle_copy(state: &Rc<AppState>) {
     match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = current_full_entry(state) {
-                if let Err(err) = copy_selected_entry(state, &entry) {
-                    set_footer(state, &format!("Copy failed: {err:#}"));
-                } else {
-                    set_footer(state, "Copied selected entry");
-                }
+            if let Some(entry) = current_entry(state)
+                && let Err(err) = queue_entry_copy(state, entry.id, AfterCopy::Report)
+            {
+                set_footer(state, &format!("Copy failed: {err:#}"));
             }
         }
         AppView::Secrets => {

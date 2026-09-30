@@ -30,6 +30,33 @@ pub enum CodeLanguage {
 }
 
 impl CodeLanguage {
+    /// Every supported language.
+    pub const ALL: [CodeLanguage; 23] = [
+        Self::Rust,
+        Self::Python,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Go,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::Java,
+        Self::Html,
+        Self::Css,
+        Self::Json,
+        Self::Yaml,
+        Self::Toml,
+        Self::Sql,
+        Self::Shell,
+        Self::Markdown,
+        Self::Php,
+        Self::Ruby,
+        Self::Lua,
+        Self::Xml,
+        Self::Diff,
+        Self::Docker,
+    ];
+
     /// Human-friendly display label (e.g. "Rust", "Python").
     pub fn display_name(&self) -> &'static str {
         match self {

@@ -204,6 +204,7 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
     crate::notify::install_change_listener(&state, &window, &paths.socket_path)?;
     let config_monitor = crate::config_reload::install_config_watcher(&state, &window, &paths)?;
     crate::events::connect(&state, &window);
+    crate::highlight::warm_languages_while_hidden(&window);
 
     // Warm the Wayland layer-shell surface and GPU context so first presentation is instant.
     WidgetExt::realize(&window);

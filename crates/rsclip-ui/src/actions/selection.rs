@@ -111,16 +111,24 @@ pub(crate) fn schedule_preview_for_current_selection(state: &Rc<AppState>) {
     });
 }
 
-pub(crate) fn mark_selected_row(list: &gtk::ListBox, selected: Option<&gtk::ListBoxRow>) {
-    let mut child = list.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        widget.remove_css_class("selected-entry");
-    }
+thread_local! {
+    /// The row carrying the `selected-entry` class, so a selection change
+    /// touches two rows instead of sweeping the whole ~120-row window.
+    static MARKED_ROW: std::cell::RefCell<Option<gtk::glib::WeakRef<gtk::ListBoxRow>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-    if let Some(row) = selected {
-        row.add_css_class("selected-entry");
-    }
+pub(crate) fn mark_selected_row(selected: Option<&gtk::ListBoxRow>) {
+    MARKED_ROW.with(|marked| {
+        let mut marked = marked.borrow_mut();
+        if let Some(previous) = marked.take().and_then(|row| row.upgrade()) {
+            previous.remove_css_class("selected-entry");
+        }
+        if let Some(row) = selected {
+            row.add_css_class("selected-entry");
+            *marked = Some(row.downgrade());
+        }
+    });
 }
 
 pub(crate) fn scroll_row_into_view(state: &Rc<AppState>, row: &gtk::ListBoxRow) {
