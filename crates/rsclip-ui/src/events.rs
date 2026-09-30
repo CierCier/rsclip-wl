@@ -26,9 +26,9 @@ use crate::actions::selection::{
 };
 use crate::actions::{set_footer, update_mode_controls};
 use crate::state::{
-    AfterCopy, AppState, AppView, CopyResponse, ListRequest, ListResponse, ListResults,
-    WorkerRequest, WorkerResponse, WriteOp, current_entry, current_secret, entry_at_row,
-    secret_at_row,
+    AfterCopy, AppState, AppView, CopyRequest, CopyResponse, ListRequest, ListResponse,
+    ListResults, WorkerRequest, WorkerResponse, WriteOp, current_entry, current_secret,
+    entry_at_row, secret_at_row,
 };
 
 /// Delay before applying search so fast typing renders only the final query.
@@ -41,16 +41,34 @@ thread_local! {
     static LIST_RESPONSE_TARGET: RefCell<Weak<AppState>> = const { RefCell::new(Weak::new()) };
 }
 
-pub(crate) fn start_list_worker(
-    db_path: std::path::PathBuf,
-) -> Result<(mpsc::Sender<WorkerRequest>, mpsc::Receiver<WorkerResponse>)> {
-    let (request_tx, request_rx) = mpsc::channel();
+/// Channels to the background SQLite workers; both answer on `response_rx`.
+pub(crate) struct Workers {
+    pub(crate) list_request_tx: mpsc::Sender<WorkerRequest>,
+    pub(crate) copy_request_tx: mpsc::Sender<CopyRequest>,
+    pub(crate) response_rx: mpsc::Receiver<WorkerResponse>,
+}
+
+/// Start the list worker and the copy worker. Copies get their own thread and
+/// connection so a payload-sized copy never delays a search.
+pub(crate) fn start_workers(db_path: std::path::PathBuf) -> Result<Workers> {
+    let (list_request_tx, list_request_rx) = mpsc::channel();
+    let (copy_request_tx, copy_request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
+    let copy_response_tx = response_tx.clone();
+    let copy_db_path = db_path.clone();
     std::thread::Builder::new()
         .name("rsclip-list".to_string())
-        .spawn(move || list_worker(db_path, request_rx, response_tx))
+        .spawn(move || list_worker(db_path, list_request_rx, response_tx))
         .context("starting list worker")?;
-    Ok((request_tx, response_rx))
+    std::thread::Builder::new()
+        .name("rsclip-copy".to_string())
+        .spawn(move || copy_worker(copy_db_path, copy_request_rx, copy_response_tx))
+        .context("starting copy worker")?;
+    Ok(Workers {
+        list_request_tx,
+        copy_request_tx,
+        response_rx,
+    })
 }
 
 pub(crate) fn connect(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
@@ -230,7 +248,7 @@ fn drain_list_responses() {
         if let Some(list) = response.list {
             apply_list_response(&state, list);
         }
-        for copy in response.copies {
+        if let Some(copy) = response.copy {
             finish_entry_copy(&state, copy);
         }
         if let Some(err) = response.write_error {
@@ -254,7 +272,7 @@ fn list_worker(
                 let response = match request {
                     WorkerRequest::Write(_) => WorkerResponse {
                         list: None,
-                        copies: Vec::new(),
+                        copy: None,
                         write_error: Some(err.clone()),
                     },
                     WorkerRequest::List(request) => WorkerResponse {
@@ -262,15 +280,7 @@ fn list_worker(
                             request,
                             result: Err(err.clone()),
                         }),
-                        copies: Vec::new(),
-                        write_error: None,
-                    },
-                    WorkerRequest::CopyEntry { then, .. } => WorkerResponse {
-                        list: None,
-                        copies: vec![CopyResponse {
-                            then,
-                            result: Err(err.clone()),
-                        }],
+                        copy: None,
                         write_error: None,
                     },
                 };
@@ -284,7 +294,6 @@ fn list_worker(
 
     while let Ok(first) = request_rx.recv() {
         let mut list_request = None;
-        let mut copies = Vec::new();
         let mut write_error = None;
         let mut next = Some(first);
         while let Some(message) = next {
@@ -298,15 +307,6 @@ fn list_worker(
                 // available, only execute the newest one. An in-flight older
                 // result is rejected in GTK.
                 WorkerRequest::List(request) => list_request = Some(request),
-                WorkerRequest::CopyEntry { id, then } => {
-                    let result = copy_entry_by_id(&db, id).map_err(|err| format!("{err:#}"));
-                    if result.is_ok()
-                        && let Err(err) = db.touch_used(id)
-                    {
-                        write_error = Some(format!("{err:#}"));
-                    }
-                    copies.push(CopyResponse { then, result });
-                }
             }
             next = request_rx.try_recv().ok();
         }
@@ -315,16 +315,47 @@ fn list_worker(
             let result = load_list(&db, &request).map_err(|err| format!("{err:#}"));
             ListResponse { request, result }
         });
-        let response = WorkerResponse {
-            list,
-            copies,
-            write_error,
-        };
-        if (response.list.is_some()
-            || !response.copies.is_empty()
-            || response.write_error.is_some())
-            && !send_worker_response(&response_tx, response)
+        if (list.is_some() || write_error.is_some())
+            && !send_worker_response(
+                &response_tx,
+                WorkerResponse {
+                    list,
+                    copy: None,
+                    write_error,
+                },
+            )
         {
+            break;
+        }
+    }
+}
+
+/// Run copies in order on a dedicated connection. The connection opens on
+/// the first copy, so an overlay that never copies never pays for it.
+fn copy_worker(
+    db_path: std::path::PathBuf,
+    request_rx: mpsc::Receiver<CopyRequest>,
+    response_tx: mpsc::Sender<WorkerResponse>,
+) {
+    let mut db = None;
+    for request in request_rx {
+        let db =
+            db.get_or_insert_with(|| Database::open(&db_path).map_err(|err| format!("{err:#}")));
+        let result = match db {
+            Ok(db) => copy_entry_by_id(db, request.id).map_err(|err| format!("{err:#}")),
+            Err(err) => Err(err.clone()),
+        };
+        let response = WorkerResponse {
+            list: None,
+            copy: Some(CopyResponse {
+                id: request.id,
+                then: request.then,
+                serial: request.serial,
+                result,
+            }),
+            write_error: None,
+        };
+        if !send_worker_response(&response_tx, response) {
             break;
         }
     }
@@ -636,7 +667,7 @@ mod tests {
     use rsclip_core::Database;
     use rsclip_core::models::{EntryFilter, NewEntry, SortMode};
 
-    use super::{SEARCH_DEBOUNCE, start_list_worker};
+    use super::{SEARCH_DEBOUNCE, start_workers};
     use crate::components::topbar::SEARCH_ENTRY_DELAY_MS;
     use crate::state::{AppView, ListRequest, ListResults, WorkerRequest, WriteOp};
 
@@ -670,7 +701,8 @@ mod tests {
         let id = db.upsert_entry(&entry).unwrap();
         drop(db);
 
-        let (request_tx, response_rx) = start_list_worker(path.clone()).unwrap();
+        let workers = start_workers(path.clone()).unwrap();
+        let (request_tx, response_rx) = (workers.list_request_tx, workers.response_rx);
         request_tx
             .send(WorkerRequest::Write(WriteOp::SetPinned {
                 id,

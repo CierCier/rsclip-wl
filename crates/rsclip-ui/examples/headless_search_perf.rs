@@ -20,8 +20,9 @@
 //!       cargo run --release -p rsclip-ui --example headless_search_perf
 //!
 //! `--idle-time=0` matters: an idle weston stops repainting, and frames then
-//! drop out of the measurements. The example refuses to run unless
-//! `XDG_STATE_HOME` contains "bench", so it never opens the live history.
+//! drop out of the measurements. The example refuses to run unless both
+//! `XDG_STATE_HOME` and `WAYLAND_DISPLAY` contain "bench", so it never opens
+//! the live history and its copy step never reaches the desktop clipboard.
 //!
 //! Optional args: `--queries "fn main,http,a"` `--cadence-ms 150`
 //! `--section typing|preview|bigtext|nav|misc|langs|all` `--verbose`.
@@ -290,9 +291,17 @@ fn main() -> anyhow::Result<()> {
     let section = arg_value(&args, "--section").unwrap_or_else(|| "all".into());
     let verbose = args.iter().any(|a| a == "--verbose");
 
+    let isolated =
+        |name| std::env::var_os(name).is_some_and(|v| v.to_string_lossy().contains("bench"));
     anyhow::ensure!(
-        std::env::var_os("XDG_STATE_HOME").is_some_and(|v| v.to_string_lossy().contains("bench")),
+        isolated("XDG_STATE_HOME"),
         "refusing to run without an isolated XDG_STATE_HOME (contains 'bench')"
+    );
+    // The copy section hands the largest entry to wl-copy; on the desktop
+    // display any client could read it.
+    anyhow::ensure!(
+        isolated("WAYLAND_DISPLAY"),
+        "refusing to run without a private WAYLAND_DISPLAY (contains 'bench')"
     );
     gtk::init()?;
     let app = gtk::Application::builder()
@@ -521,7 +530,7 @@ fn misc_section(state: &Rc<AppState>) {
         d.iter().map(|d| ms(d.dur)).sum::<f64>()
     );
     // Enter / Ctrl+C on the largest entry: the read and wl-copy run on the
-    // list worker; the GTK thread only queues the request.
+    // copy worker; the GTK thread only queues the request.
     let all = all_summaries(state);
     if let Some(big) = all.iter().max_by_key(|e| e.size_bytes) {
         let origin = Instant::now();

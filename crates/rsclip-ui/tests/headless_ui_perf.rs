@@ -169,7 +169,7 @@ fn assert_preview_bounded(state: &Rc<AppState>, case: &str) {
             body.split('\n').count()
         );
         assert!(
-            body.len() <= MAX_PREVIEW_BYTES + 1 + PREVIEW_LINE_TRUNCATED_MARKER.len(),
+            body.len() <= MAX_PREVIEW_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len(),
             "{case}: preview shows {} bytes",
             body.len()
         );
@@ -224,6 +224,7 @@ fn write_large_png(path: &Path) {
 
 struct Seeded {
     huge_id: i64,
+    huge_len: usize,
     image_id: i64,
 }
 
@@ -281,8 +282,13 @@ fn seed_history(paths: &RsclipPaths) -> Seeded {
         format!("qxbase{}", "QUJDRA==".repeat(8 * 1024)),
     );
     let huge = format!("qxhuge {}\n", "legacy payload line ".repeat(8)).repeat(30_000);
+    let huge_len = huge.len();
     let huge_id = insert_text(&db, "huge", huge);
-    Seeded { huge_id, image_id }
+    Seeded {
+        huge_id,
+        huge_len,
+        image_id,
+    }
 }
 
 fn main() {
@@ -306,6 +312,22 @@ fn perf_gtk_thread_stays_responsive() {
     )
     .unwrap();
 
+    // Headless weston has no seat for the real wl-copy; this stand-in keeps
+    // what it is given, so the test can check the whole payload arrived.
+    let bin_dir = root.join("bin");
+    let clipboard_file = root.join("clipboard");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join("wl-copy"),
+        format!("#!/bin/sh\ncat > '{}'\n", clipboard_file.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin_dir.join("wl-copy"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+
     let Some(_weston) = start_weston(&runtime_dir, &root.join("weston.log")) else {
         assert!(
             !required,
@@ -326,6 +348,10 @@ fn perf_gtk_thread_stays_responsive() {
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
         std::env::set_var("GDK_BACKEND", "wayland");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![bin_dir.clone()];
+        dirs.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
         std::env::remove_var("DISPLAY");
         if std::env::var_os("GSK_RENDERER").is_none() {
             std::env::set_var("GSK_RENDERER", "cairo");
@@ -431,15 +457,65 @@ fn perf_gtk_thread_stays_responsive() {
         &round_totals[1..]
     );
 
-    // Copying the multi-megabyte row: the read and wl-copy run on the worker.
+    // Copying the multi-megabyte row: the read and wl-copy run on the copy
+    // worker, and the whole payload must reach the clipboard.
     type_query(&state, "qxhuge", Duration::from_millis(100));
+    state.footer.set_text("");
     let started = Instant::now();
     actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Report).unwrap();
-    let sync = ms(started.elapsed());
+    let mut worst_copy = ms(started.elapsed());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.footer.text().is_empty() && Instant::now() < deadline {
+        worst_copy = worst_copy.max(pump(Duration::from_millis(20)));
+    }
+    assert_eq!(
+        state.footer.text(),
+        "Copied selected entry",
+        "copying the 5 MB entry did not succeed"
+    );
+    let copied = std::fs::metadata(&clipboard_file).map_or(0, |meta| meta.len() as usize);
+    assert_eq!(copied, seeded.huge_len, "wl-copy got a partial payload");
     results.push((
         "copy 5 MB entry".into(),
-        sync.max(pump(Duration::from_millis(1_000))),
+        worst_copy.max(pump(Duration::from_millis(300))),
     ));
+
+    // A paste only fires for the newest clipboard write in the same overlay
+    // session: a later copy, or closing and reopening, cancels it.
+    state.auto_paste.set(false);
+    let pump_until = |done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
+            pump(Duration::from_millis(20));
+        }
+    };
+    state.footer.set_text("");
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Report).unwrap();
+    // Copies finish in order, so the report arrives after the paste.
+    pump_until(&|| !state.footer.text().is_empty());
+    assert!(
+        runtime.window.is_visible(),
+        "a paste fired after a later copy replaced its clipboard value"
+    );
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
+    runtime.hide();
+    runtime.show_reset().unwrap();
+    // No later request to wait on without superseding it; the copy takes
+    // well under this.
+    pump(Duration::from_secs(2));
+    assert!(
+        runtime.window.is_visible(),
+        "a paste from a closed overlay session closed the reopened one"
+    );
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
+    pump_until(&|| !runtime.window.is_visible());
+    assert!(
+        !runtime.window.is_visible(),
+        "a current paste did not close the overlay"
+    );
+    runtime.show_reset().unwrap();
+    settle();
 
     // Favicon fetch landing while the overlay is open.
     type_query(&state, "site", Duration::from_millis(100));

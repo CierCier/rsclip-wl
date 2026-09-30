@@ -7,6 +7,7 @@ use anyhow::Context;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use rsclip_core::Database;
+use rsclip_core::format::{RelativeAge, relative_age};
 use rsclip_core::models::{ClipboardEntry, EntryFilter, SecretEntry, SortMode};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -16,12 +17,15 @@ pub(crate) enum AppView {
 }
 
 /// Identity of a rendered list row: equal keys render identical widgets, so
-/// window shifts can keep those rows instead of rebuilding them.
+/// window shifts and new queries can keep those rows instead of rebuilding
+/// them. `age` is the relative time the row shows, so a kept row never keeps
+/// an outdated "5 min".
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RowKey {
     view: AppView,
     id: i64,
     updated_at: i64,
+    age: RelativeAge,
     pinned: bool,
 }
 
@@ -31,6 +35,7 @@ impl RowKey {
             view: AppView::Clipboard,
             id: entry.id,
             updated_at: entry.updated_at,
+            age: relative_age(entry.updated_at),
             pinned: entry.pinned,
         }
     }
@@ -40,6 +45,7 @@ impl RowKey {
             view: AppView::Secrets,
             id: secret.id,
             updated_at: secret.updated_at,
+            age: relative_age(secret.updated_at),
             pinned: false,
         }
     }
@@ -50,6 +56,7 @@ impl RowKey {
             view: AppView::Clipboard,
             id,
             updated_at: 0,
+            age: RelativeAge::Now,
             pinned: false,
         }
     }
@@ -112,6 +119,7 @@ pub(crate) enum WriteOp {
         id: i64,
         alias: String,
     },
+    TouchEntry(i64),
     TouchSecret(i64),
 }
 
@@ -131,6 +139,7 @@ impl WriteOp {
                 })
             }
             Self::RenameSecret { id, alias } => db.rename_secret(*id, alias),
+            Self::TouchEntry(id) => db.touch_used(*id),
             Self::TouchSecret(id) => db.touch_secret_used(*id),
         }
     }
@@ -149,28 +158,34 @@ pub(crate) enum AfterCopy {
 pub(crate) enum WorkerRequest {
     Write(WriteOp),
     List(ListRequest),
-    /// Read an entry's full payload, hand it to `wl-copy`, and mark it used.
-    ///
-    /// Both steps scale with the payload: reading a legacy 40 MB row took
-    /// ~140 ms and piping it to `wl-copy` more, all of it on the GTK thread.
-    CopyEntry {
-        id: i64,
-        then: AfterCopy,
-    },
 }
 
-/// Result of a [`WorkerRequest::CopyEntry`].
-pub(crate) struct CopyResponse {
+/// Read an entry's full payload and hand it to `wl-copy`, on the copy worker.
+///
+/// Both steps scale with the payload: reading a legacy 40 MB row took
+/// ~140 ms and piping it to `wl-copy` more, all of it on the GTK thread. They
+/// run on their own thread so a large copy never holds up a search.
+pub(crate) struct CopyRequest {
+    pub(crate) id: i64,
     pub(crate) then: AfterCopy,
+    /// [`AppState::clipboard_serial`] when the copy was queued.
+    pub(crate) serial: u64,
+}
+
+/// Result of a [`CopyRequest`].
+pub(crate) struct CopyResponse {
+    pub(crate) id: i64,
+    pub(crate) then: AfterCopy,
+    pub(crate) serial: u64,
     pub(crate) result: Result<(), String>,
 }
 
-/// Worker output: the newest list result, finished copies, and/or failures of
-/// writes applied before them (reported after the list renders so its footer
-/// cannot hide them).
+/// Worker output: the newest list result and/or failures of writes applied
+/// before it (reported after the list renders so its footer cannot hide
+/// them), or a finished copy from the copy worker.
 pub(crate) struct WorkerResponse {
     pub(crate) list: Option<ListResponse>,
-    pub(crate) copies: Vec<CopyResponse>,
+    pub(crate) copy: Option<CopyResponse>,
     pub(crate) write_error: Option<String>,
 }
 
@@ -196,6 +211,11 @@ pub(crate) struct AppState {
     pub(crate) list_request_tx: mpsc::Sender<WorkerRequest>,
     pub(crate) list_response_rx: mpsc::Receiver<WorkerResponse>,
     pub(crate) list_generation: Cell<u64>,
+    pub(crate) copy_request_tx: mpsc::Sender<CopyRequest>,
+    /// Bumped by every clipboard write and by hiding the overlay. A queued
+    /// paste only fires while it still matches, so it can never paste a
+    /// later copy's value or into a session the user already closed.
+    pub(crate) clipboard_serial: Cell<u64>,
     pub(crate) favicon_icon_dir: PathBuf,
     /// Daemon capture budget (`[history] max_entries`). The daemon never
     /// prunes to it, so the list does not clamp counts by this value.
@@ -255,6 +275,13 @@ pub(crate) fn advance_list_generation(state: &AppState) -> u64 {
     let generation = state.list_generation.get().wrapping_add(1);
     state.list_generation.set(generation);
     generation
+}
+
+/// Invalidate any pending paste; returns the new serial.
+pub(crate) fn advance_clipboard_serial(state: &AppState) -> u64 {
+    let serial = state.clipboard_serial.get().wrapping_add(1);
+    state.clipboard_serial.set(serial);
+    serial
 }
 
 /// Return the selected list summary without reading its full payload from SQLite.

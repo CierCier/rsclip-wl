@@ -18,6 +18,19 @@ pub fn secret_value_from_entry(entry: &ClipboardEntry) -> Option<String> {
     }
 }
 
+/// Whether a list summary of `entry` may still yield a secret value.
+///
+/// Summaries drop text payloads and cut OCR text, so a value past the cut
+/// is invisible here; only kinds that can never hold one are rejected, and
+/// [`secret_value_from_entry`] on the full entry decides the rest.
+pub fn summary_may_hold_secret(entry: &ClipboardEntry) -> bool {
+    match &entry.data {
+        EntryData::Image { ocr_text, .. } => ocr_text.is_some(),
+        EntryData::Color { .. } | EntryData::File { .. } => false,
+        EntryData::Link { .. } | EntryData::Text | EntryData::Unknown => true,
+    }
+}
+
 /// Generates a sensible default alias when promoting a clipboard entry to a secret.
 pub fn default_secret_alias(entry: &ClipboardEntry) -> String {
     if matches!(
@@ -49,7 +62,10 @@ pub fn normalize_secret_alias(alias: &str) -> &str {
 mod tests {
     use crate::models::{ClipboardEntry, EntryData};
 
-    use super::{default_secret_alias, normalize_secret_alias, secret_value_from_entry};
+    use super::{
+        default_secret_alias, normalize_secret_alias, secret_value_from_entry,
+        summary_may_hold_secret,
+    };
 
     #[test]
     fn extracts_text_like_secret_values() {
@@ -80,6 +96,27 @@ mod tests {
 
         let color = ClipboardEntry::test_color(1, "#ff0000", "hex");
         assert_eq!(secret_value_from_entry(&color), None);
+    }
+
+    #[test]
+    fn summary_check_defers_truncated_text_to_the_full_entry() {
+        // A text summary carries no payload; the value may sit past the cut.
+        let mut text = ClipboardEntry::test_text(1, "Title");
+        text.text_content = None;
+        text.preview_text = Some("   ".to_string());
+        assert!(summary_may_hold_secret(&text));
+
+        let mut image = ClipboardEntry::test_image(1, "/tmp/test.png");
+        assert!(!summary_may_hold_secret(&image));
+        image.data = EntryData::Image {
+            file_path: String::new(),
+            thumb_path: None,
+            ocr_text: Some("   ".to_string()),
+        };
+        assert!(summary_may_hold_secret(&image));
+
+        let color = ClipboardEntry::test_color(1, "#ff0000", "hex");
+        assert!(!summary_may_hold_secret(&color));
     }
 
     #[test]

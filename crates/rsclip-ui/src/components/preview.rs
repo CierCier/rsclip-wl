@@ -474,7 +474,7 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         let state = Rc::clone(state);
         let paths = paths.clone();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&paths) {
+            if let Err(err) = crate::actions::clipboard::copy_text(&state, &paths) {
                 crate::actions::set_footer(&state, &format!("Copy paths failed: {err:#}"));
             } else {
                 crate::actions::set_footer(&state, "Copied paths");
@@ -548,7 +548,7 @@ fn render_ocr_header(state: &Rc<AppState>, ocr: &str) {
         let state = Rc::clone(state);
         let ocr = ocr.to_string();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&ocr) {
+            if let Err(err) = crate::actions::clipboard::copy_text(&state, &ocr) {
                 crate::actions::set_footer(&state, &format!("Copy OCR failed: {err:#}"));
             } else {
                 crate::actions::set_footer(&state, "Copied OCR text");
@@ -722,7 +722,9 @@ pub(crate) fn bounded_full_preview(text: &str) -> std::borrow::Cow<'_, str> {
     );
     let mut truncated = false;
     for (index, line) in text.split('\n').enumerate() {
-        if index == MAX_PREVIEW_LINES {
+        // Stop before the separator once the budget is spent: empty lines
+        // would otherwise keep adding one byte each past it.
+        if index == MAX_PREVIEW_LINES || (index > 0 && preview.len() >= MAX_PREVIEW_BYTES) {
             truncated = true;
             break;
         }
@@ -775,6 +777,12 @@ mod tests {
             ),
             ("100k empty lines", "\n".repeat(100_000)),
             (
+                "exactly full budget, then empty lines",
+                format!("{}\n", "z".repeat(MAX_PREVIEW_LINE_BYTES - 1)).repeat(15)
+                    + &"z".repeat(MAX_PREVIEW_LINE_BYTES)
+                    + &"\n".repeat(300),
+            ),
+            (
                 "long lines between short ones",
                 format!("head\n{}\ntail\n", "y".repeat(10_000)).repeat(20),
             ),
@@ -788,10 +796,7 @@ mod tests {
     /// Every preview must stay within the layout bounds, whatever the payload.
     #[test]
     fn perf_preview_text_stays_within_layout_bounds() {
-        let max_total = MAX_PREVIEW_BYTES
-            + 1
-            + PREVIEW_LINE_TRUNCATED_MARKER.len()
-            + FULL_PREVIEW_TRUNCATED_NOTICE.len();
+        let max_body = MAX_PREVIEW_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len();
         let max_line = MAX_PREVIEW_LINE_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len();
         for (name, payload) in pathological_payloads() {
             let preview = bounded_full_preview(&payload);
@@ -799,9 +804,9 @@ mod tests {
                 .strip_suffix(FULL_PREVIEW_TRUNCATED_NOTICE)
                 .unwrap_or(&preview);
             assert!(
-                preview.len() <= max_total,
-                "{name}: preview is {} bytes",
-                preview.len()
+                body.len() <= max_body,
+                "{name}: preview body is {} bytes",
+                body.len()
             );
             assert!(
                 body.split('\n').count() <= MAX_PREVIEW_LINES,
