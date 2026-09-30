@@ -153,6 +153,7 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
         list_generation: Cell::new(0),
         copy_request_tx: workers.copy_request_tx,
         clipboard_serial: Cell::new(0),
+        pending_copies: Cell::new(0),
         favicon_icon_dir: paths.favicon_icon_dir.clone(),
         history_limit: Cell::new(config.history.max_entries),
         auto_paste: Cell::new(config.paste.auto_paste),

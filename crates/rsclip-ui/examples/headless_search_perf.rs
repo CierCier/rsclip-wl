@@ -534,8 +534,9 @@ fn misc_section(state: &Rc<AppState>) {
     let all = all_summaries(state);
     if let Some(big) = all.iter().max_by_key(|e| e.size_bytes) {
         let origin = Instant::now();
-        let (_, t) =
-            time(|| actions::clipboard::queue_entry_copy(state, big.id, state::AfterCopy::Report));
+        let (_, t) = time(|| {
+            actions::clipboard::queue_entry_copy(state, big.id, state::AfterCopy::REPORT_ENTRY)
+        });
         let d = pump(state, Duration::from_millis(1_000), origin);
         println!(
             "copy largest entry ({} bytes): sync {t:.2} ms, worst following dispatch {:.2} ms",

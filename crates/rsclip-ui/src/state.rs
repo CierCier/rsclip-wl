@@ -145,13 +145,53 @@ impl WriteOp {
     }
 }
 
-/// What the GTK thread does once the worker finished copying an entry.
+/// What the GTK thread does once the copy worker finished a copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AfterCopy {
     /// Close the overlay and paste (Enter, row activation).
     Paste,
-    /// Keep the overlay open and report the copy in the footer (Ctrl+C).
-    Report,
+    /// Close the overlay without pasting (Enter on a secret).
+    Hide,
+    /// Keep the overlay open and report the copy in the footer.
+    Report {
+        done: &'static str,
+        failed: &'static str,
+    },
+}
+
+impl AfterCopy {
+    /// Ctrl+C on a history entry.
+    pub(crate) const REPORT_ENTRY: Self = Self::Report {
+        done: "Copied selected entry",
+        failed: "Copy failed",
+    };
+    pub(crate) const REPORT_SECRET: Self = Self::Report {
+        done: "Copied secret",
+        failed: "Copy failed",
+    };
+}
+
+/// What a [`CopyRequest`] puts on the clipboard.
+pub(crate) enum CopySource {
+    /// A history entry; the worker reads its full payload.
+    Entry(i64),
+    Secret {
+        id: i64,
+        value: String,
+    },
+    /// Preview text (file paths, OCR); nothing to mark as used.
+    Text(String),
+}
+
+impl CopySource {
+    /// The write that records this copy as a use, once it succeeded.
+    pub(crate) fn touch(&self) -> Option<WriteOp> {
+        match self {
+            Self::Entry(id) => Some(WriteOp::TouchEntry(*id)),
+            Self::Secret { id, .. } => Some(WriteOp::TouchSecret(*id)),
+            Self::Text(_) => None,
+        }
+    }
 }
 
 /// Messages to the list worker, processed in order.
@@ -160,13 +200,15 @@ pub(crate) enum WorkerRequest {
     List(ListRequest),
 }
 
-/// Read an entry's full payload and hand it to `wl-copy`, on the copy worker.
+/// A clipboard write, run on the copy worker.
 ///
-/// Both steps scale with the payload: reading a legacy 40 MB row took
-/// ~140 ms and piping it to `wl-copy` more, all of it on the GTK thread. They
-/// run on their own thread so a large copy never holds up a search.
+/// Every write goes through this one ordered worker, so a slow copy can
+/// never overwrite a newer one. An entry copy scales with the payload:
+/// reading a legacy 40 MB row took ~140 ms and piping it to `wl-copy` more,
+/// all of it on the GTK thread. The worker has its own thread, so a large
+/// copy never holds up a search either.
 pub(crate) struct CopyRequest {
-    pub(crate) id: i64,
+    pub(crate) source: CopySource,
     pub(crate) then: AfterCopy,
     /// [`AppState::clipboard_serial`] when the copy was queued.
     pub(crate) serial: u64,
@@ -174,7 +216,8 @@ pub(crate) struct CopyRequest {
 
 /// Result of a [`CopyRequest`].
 pub(crate) struct CopyResponse {
-    pub(crate) id: i64,
+    /// Applied on success: see [`CopySource::touch`].
+    pub(crate) touch: Option<WriteOp>,
     pub(crate) then: AfterCopy,
     pub(crate) serial: u64,
     pub(crate) result: Result<(), String>,
@@ -216,6 +259,8 @@ pub(crate) struct AppState {
     /// paste only fires while it still matches, so it can never paste a
     /// later copy's value or into a session the user already closed.
     pub(crate) clipboard_serial: Cell<u64>,
+    /// Copies queued on the copy worker that GTK has not finished handling.
+    pub(crate) pending_copies: Cell<usize>,
     pub(crate) favicon_icon_dir: PathBuf,
     /// Daemon capture budget (`[history] max_entries`). The daemon never
     /// prunes to it, so the list does not clamp counts by this value.

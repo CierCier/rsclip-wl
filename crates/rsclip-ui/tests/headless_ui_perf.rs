@@ -462,7 +462,7 @@ fn perf_gtk_thread_stays_responsive() {
     type_query(&state, "qxhuge", Duration::from_millis(100));
     state.footer.set_text("");
     let started = Instant::now();
-    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Report).unwrap();
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::REPORT_ENTRY).unwrap();
     let mut worst_copy = ms(started.elapsed());
     let deadline = Instant::now() + Duration::from_secs(10);
     while state.footer.text().is_empty() && Instant::now() < deadline {
@@ -489,11 +489,11 @@ fn perf_gtk_thread_stays_responsive() {
             pump(Duration::from_millis(20));
         }
     };
-    state.footer.set_text("");
+    let copies_done = || state.pending_copies.get() == 0;
     actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
-    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Report).unwrap();
-    // Copies finish in order, so the report arrives after the paste.
-    pump_until(&|| !state.footer.text().is_empty());
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::REPORT_ENTRY).unwrap();
+    pump_until(&copies_done);
+    assert!(copies_done(), "copies did not finish");
     assert!(
         runtime.window.is_visible(),
         "a paste fired after a later copy replaced its clipboard value"
@@ -501,13 +501,25 @@ fn perf_gtk_thread_stays_responsive() {
     actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
     runtime.hide();
     runtime.show_reset().unwrap();
-    // No later request to wait on without superseding it; the copy takes
-    // well under this.
-    pump(Duration::from_secs(2));
+    pump_until(&copies_done);
+    assert!(copies_done(), "the copy did not finish");
     assert!(
         runtime.window.is_visible(),
         "a paste from a closed overlay session closed the reopened one"
     );
+
+    // Every clipboard write is ordered: a small copy queued behind a large
+    // one must not be overwritten by it.
+    actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::REPORT_ENTRY).unwrap();
+    let newer = state::CopySource::Text("newer value".into());
+    actions::clipboard::queue_copy(&state, newer, AfterCopy::REPORT_SECRET).unwrap();
+    pump_until(&copies_done);
+    assert_eq!(
+        std::fs::read_to_string(&clipboard_file).unwrap(),
+        "newer value",
+        "an older copy overwrote a newer clipboard value"
+    );
+
     actions::clipboard::queue_entry_copy(&state, seeded.huge_id, AfterCopy::Paste).unwrap();
     pump_until(&|| !runtime.window.is_visible());
     assert!(

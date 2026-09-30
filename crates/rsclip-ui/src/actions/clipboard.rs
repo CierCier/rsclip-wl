@@ -8,16 +8,38 @@ use rsclip_core::paste::{copy_entry, write_clipboard};
 
 use crate::events::queue_write;
 use crate::state::{
-    AfterCopy, AppState, CopyRequest, CopyResponse, WriteOp, advance_clipboard_serial,
+    AfterCopy, AppState, CopyRequest, CopyResponse, CopySource, advance_clipboard_serial,
 };
 
-/// Copy an entry on the copy worker; [`finish_entry_copy`] runs when it is done.
-pub(crate) fn queue_entry_copy(state: &Rc<AppState>, id: i64, then: AfterCopy) -> Result<()> {
+/// Queue a clipboard write on the copy worker; [`finish_copy`] runs when it is done.
+pub(crate) fn queue_copy(state: &Rc<AppState>, source: CopySource, then: AfterCopy) -> Result<()> {
     let serial = advance_clipboard_serial(state);
     state
         .copy_request_tx
-        .send(CopyRequest { id, then, serial })
-        .map_err(|_| anyhow::anyhow!("copy worker stopped"))
+        .send(CopyRequest {
+            source,
+            then,
+            serial,
+        })
+        .map_err(|_| anyhow::anyhow!("copy worker stopped"))?;
+    state.pending_copies.set(state.pending_copies.get() + 1);
+    Ok(())
+}
+
+pub(crate) fn queue_entry_copy(state: &Rc<AppState>, id: i64, then: AfterCopy) -> Result<()> {
+    queue_copy(state, CopySource::Entry(id), then)
+}
+
+pub(crate) fn queue_secret_copy(
+    state: &Rc<AppState>,
+    secret: &SecretEntry,
+    then: AfterCopy,
+) -> Result<()> {
+    let source = CopySource::Secret {
+        id: secret.id,
+        value: secret.value.clone(),
+    };
+    queue_copy(state, source, then)
 }
 
 /// Copy one entry to the clipboard. Runs on the copy worker.
@@ -26,10 +48,18 @@ pub(crate) fn copy_entry_by_id(db: &Database, id: i64) -> Result<()> {
     copy_entry(&entry)
 }
 
+pub(crate) fn copy_text(text: &str) -> Result<()> {
+    write_clipboard("text/plain", text.as_bytes())
+}
+
 /// Apply a finished worker copy on the GTK thread.
-pub(crate) fn finish_entry_copy(state: &Rc<AppState>, copy: CopyResponse) {
+pub(crate) fn finish_copy(state: &Rc<AppState>, copy: CopyResponse) {
+    state
+        .pending_copies
+        .set(state.pending_copies.get().saturating_sub(1));
     if copy.result.is_ok()
-        && let Err(err) = queue_write(state, WriteOp::TouchEntry(copy.id))
+        && let Some(touch) = copy.touch
+        && let Err(err) = queue_write(state, touch)
     {
         crate::actions::set_footer(state, &format!("Update failed: {err:#}"));
     }
@@ -39,32 +69,32 @@ pub(crate) fn finish_entry_copy(state: &Rc<AppState>, copy: CopyResponse) {
     if copy.serial != state.clipboard_serial.get() {
         return;
     }
+    let window = || {
+        state
+            .list
+            .root()
+            .and_then(|root| root.downcast::<gtk4::ApplicationWindow>().ok())
+    };
     match (copy.result, copy.then) {
         (Err(err), AfterCopy::Paste) => {
             crate::actions::set_footer(state, &format!("Paste failed: {err}"))
         }
-        (Err(err), AfterCopy::Report) => {
+        (Err(err), AfterCopy::Hide) => {
             crate::actions::set_footer(state, &format!("Copy failed: {err}"))
         }
-        (Ok(()), AfterCopy::Report) => crate::actions::set_footer(state, "Copied selected entry"),
+        (Err(err), AfterCopy::Report { failed, .. }) => {
+            crate::actions::set_footer(state, &format!("{failed}: {err}"))
+        }
+        (Ok(()), AfterCopy::Report { done, .. }) => crate::actions::set_footer(state, done),
         (Ok(()), AfterCopy::Paste) => {
-            let window = state
-                .list
-                .root()
-                .and_then(|root| root.downcast::<gtk4::ApplicationWindow>().ok());
-            if let Some(window) = window {
+            if let Some(window) = window() {
                 crate::window::close_overlay_and_paste(state, &window);
             }
         }
+        (Ok(()), AfterCopy::Hide) => {
+            if let Some(window) = window() {
+                crate::window::hide_overlay(state, &window);
+            }
+        }
     }
-}
-
-pub(crate) fn copy_secret(state: &Rc<AppState>, secret: &SecretEntry) -> Result<()> {
-    copy_text(state, &secret.value)?;
-    queue_write(state, WriteOp::TouchSecret(secret.id))
-}
-
-pub(crate) fn copy_text(state: &AppState, text: &str) -> Result<()> {
-    advance_clipboard_serial(state);
-    write_clipboard("text/plain", text.as_bytes())
 }

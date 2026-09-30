@@ -12,7 +12,7 @@ use sourceview5::prelude::*;
 
 use crate::components::details::{render_details, render_secret_details};
 use crate::components::labels::{muted_label, section_label};
-use crate::state::AppState;
+use crate::state::{AfterCopy, AppState, CopySource};
 
 /// Bytes of an entry that previews read. The first 64 KiB of every text entry
 /// sits in the `entry_text` side table, so reads within this bound stay cheap
@@ -134,10 +134,12 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
         let state = Rc::clone(state);
         let secret = secret.clone();
         copy_button.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_secret(&state, &secret) {
+            if let Err(err) = crate::actions::clipboard::queue_secret_copy(
+                &state,
+                &secret,
+                AfterCopy::REPORT_SECRET,
+            ) {
                 crate::actions::set_footer(&state, &format!("Copy failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied secret");
             }
         });
     }
@@ -474,10 +476,13 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         let state = Rc::clone(state);
         let paths = paths.clone();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&state, &paths) {
+            let then = AfterCopy::Report {
+                done: "Copied paths",
+                failed: "Copy paths failed",
+            };
+            let source = CopySource::Text(paths.clone());
+            if let Err(err) = crate::actions::clipboard::queue_copy(&state, source, then) {
                 crate::actions::set_footer(&state, &format!("Copy paths failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied paths");
             }
         });
     }
@@ -548,10 +553,13 @@ fn render_ocr_header(state: &Rc<AppState>, ocr: &str) {
         let state = Rc::clone(state);
         let ocr = ocr.to_string();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&state, &ocr) {
+            let then = AfterCopy::Report {
+                done: "Copied OCR text",
+                failed: "Copy OCR failed",
+            };
+            let source = CopySource::Text(ocr.clone());
+            if let Err(err) = crate::actions::clipboard::queue_copy(&state, source, then) {
                 crate::actions::set_footer(&state, &format!("Copy OCR failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied OCR text");
             }
         });
     }
