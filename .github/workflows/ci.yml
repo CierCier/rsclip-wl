@@ -16,8 +16,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Includes the performance regression tests (db::perf_tests and the
-      # key-repeat/search-latency tests in rsclip-ui).
+      # Includes the performance regression tests (db::perf_tests, the
+      # key-repeat/search-latency tests in rsclip-ui, and the headless UI
+      # test, which drives the real window on a private weston and fails if
+      # the GTK thread stalls).
       - name: Run tests
         run: |
           docker run --rm \
@@ -31,6 +33,8 @@ jobs:
                 gtk4 \
                 gtk4-layer-shell \
                 gtksourceview5 \
-                rust
-              cargo test --workspace --locked
+                rust \
+                ttf-dejavu \
+                weston
+              RSCLIP_REQUIRE_HEADLESS_UI=1 cargo test --workspace --locked
             '
