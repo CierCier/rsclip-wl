@@ -10,7 +10,9 @@ use gtk4 as gtk;
 use rsclip_core::Database;
 use rsclip_core::models::{EntryFilter, EntryKind};
 
-use crate::actions::clipboard::{copy_secret, copy_selected_entry};
+use crate::actions::clipboard::{
+    copy_entry_by_id, copy_text, finish_copy, queue_entry_copy, queue_secret_copy,
+};
 use crate::actions::ocr::run_ocr_for_entry;
 use crate::actions::refresh::{
     apply_clipboard_search_results, apply_secret_search_results, refresh_entries,
@@ -24,8 +26,9 @@ use crate::actions::selection::{
 };
 use crate::actions::{set_footer, update_mode_controls};
 use crate::state::{
-    AppState, AppView, ListRequest, ListResponse, ListResults, WorkerRequest, WorkerResponse,
-    WriteOp, current_entry, current_full_entry, current_secret, full_entry_at_row, secret_at_row,
+    AfterCopy, AppState, AppView, CopyRequest, CopyResponse, CopySource, ListRequest, ListResponse,
+    ListResults, WorkerRequest, WorkerResponse, WriteOp, current_entry, current_secret,
+    entry_at_row, secret_at_row,
 };
 
 /// Delay before applying search so fast typing renders only the final query.
@@ -38,16 +41,34 @@ thread_local! {
     static LIST_RESPONSE_TARGET: RefCell<Weak<AppState>> = const { RefCell::new(Weak::new()) };
 }
 
-pub(crate) fn start_list_worker(
-    db_path: std::path::PathBuf,
-) -> Result<(mpsc::Sender<WorkerRequest>, mpsc::Receiver<WorkerResponse>)> {
-    let (request_tx, request_rx) = mpsc::channel();
+/// Channels to the background SQLite workers; both answer on `response_rx`.
+pub(crate) struct Workers {
+    pub(crate) list_request_tx: mpsc::Sender<WorkerRequest>,
+    pub(crate) copy_request_tx: mpsc::Sender<CopyRequest>,
+    pub(crate) response_rx: mpsc::Receiver<WorkerResponse>,
+}
+
+/// Start the list worker and the copy worker. Copies get their own thread and
+/// connection so a payload-sized copy never delays a search.
+pub(crate) fn start_workers(db_path: std::path::PathBuf) -> Result<Workers> {
+    let (list_request_tx, list_request_rx) = mpsc::channel();
+    let (copy_request_tx, copy_request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
+    let copy_response_tx = response_tx.clone();
+    let copy_db_path = db_path.clone();
     std::thread::Builder::new()
         .name("rsclip-list".to_string())
-        .spawn(move || list_worker(db_path, request_rx, response_tx))
+        .spawn(move || list_worker(db_path, list_request_rx, response_tx))
         .context("starting list worker")?;
-    Ok((request_tx, response_rx))
+    std::thread::Builder::new()
+        .name("rsclip-copy".to_string())
+        .spawn(move || copy_worker(copy_db_path, copy_request_rx, copy_response_tx))
+        .context("starting copy worker")?;
+    Ok(Workers {
+        list_request_tx,
+        copy_request_tx,
+        response_rx,
+    })
 }
 
 pub(crate) fn connect(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
@@ -59,7 +80,7 @@ pub(crate) fn connect(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
     connect_filter(state);
     connect_lazy_scroll(state);
     connect_list_selection(state);
-    connect_list_activation(state, window);
+    connect_list_activation(state);
     connect_keyboard(state, window);
 }
 
@@ -195,7 +216,7 @@ pub(crate) fn queue_write(state: &Rc<AppState>, op: WriteOp) -> Result<()> {
     send_to_worker(state, WorkerRequest::Write(op))
 }
 
-fn send_to_worker(state: &Rc<AppState>, request: WorkerRequest) -> Result<()> {
+pub(crate) fn send_to_worker(state: &Rc<AppState>, request: WorkerRequest) -> Result<()> {
     state
         .list_request_tx
         .send(request)
@@ -227,6 +248,9 @@ fn drain_list_responses() {
         if let Some(list) = response.list {
             apply_list_response(&state, list);
         }
+        if let Some(copy) = response.copy {
+            finish_copy(&state, copy);
+        }
         if let Some(err) = response.write_error {
             set_footer(&state, &format!("Update failed: {err}"));
         }
@@ -248,6 +272,7 @@ fn list_worker(
                 let response = match request {
                     WorkerRequest::Write(_) => WorkerResponse {
                         list: None,
+                        copy: None,
                         write_error: Some(err.clone()),
                     },
                     WorkerRequest::List(request) => WorkerResponse {
@@ -255,6 +280,7 @@ fn list_worker(
                             request,
                             result: Err(err.clone()),
                         }),
+                        copy: None,
                         write_error: None,
                     },
                 };
@@ -290,8 +316,53 @@ fn list_worker(
             ListResponse { request, result }
         });
         if (list.is_some() || write_error.is_some())
-            && !send_worker_response(&response_tx, WorkerResponse { list, write_error })
+            && !send_worker_response(
+                &response_tx,
+                WorkerResponse {
+                    list,
+                    copy: None,
+                    write_error,
+                },
+            )
         {
+            break;
+        }
+    }
+}
+
+/// Run clipboard writes in order. The connection opens on the first entry
+/// copy, so an overlay that never copies one never pays for it.
+fn copy_worker(
+    db_path: std::path::PathBuf,
+    request_rx: mpsc::Receiver<CopyRequest>,
+    response_tx: mpsc::Sender<WorkerResponse>,
+) {
+    let mut db = None;
+    for request in request_rx {
+        let result = match &request.source {
+            CopySource::Entry(id) => {
+                match db.get_or_insert_with(|| {
+                    Database::open(&db_path).map_err(|err| format!("{err:#}"))
+                }) {
+                    Ok(db) => copy_entry_by_id(db, *id).map_err(|err| format!("{err:#}")),
+                    Err(err) => Err(err.clone()),
+                }
+            }
+            CopySource::Secret { value, .. } | CopySource::Text(value) => {
+                copy_text(value).map_err(|err| format!("{err:#}"))
+            }
+        };
+        let response = WorkerResponse {
+            list: None,
+            copy: Some(CopyResponse {
+                touch: request.source.touch(),
+                then: request.then,
+                serial: request.serial,
+                result,
+            }),
+            write_error: None,
+        };
+        if !send_worker_response(&response_tx, response) {
             break;
         }
     }
@@ -399,8 +470,8 @@ fn connect_filter(state: &Rc<AppState>) {
 fn connect_list_selection(state: &Rc<AppState>) {
     let list = state.list.clone();
     let state = Rc::clone(state);
-    list.connect_row_selected(move |list, row| {
-        mark_selected_row(list, row);
+    list.connect_row_selected(move |_, row| {
+        mark_selected_row(row);
         // Window rebuilds already render the preview directly via
         // select_*_row; skipping here avoids a second sync DB read and
         // TextView layout per rebuild.
@@ -413,27 +484,22 @@ fn connect_list_selection(state: &Rc<AppState>) {
     });
 }
 
-fn connect_list_activation(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
+fn connect_list_activation(state: &Rc<AppState>) {
     let list = state.list.clone();
     let state = Rc::clone(state);
-    let window = window.clone();
     list.connect_row_activated(move |_, row| match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = full_entry_at_row(&state, row) {
-                if let Err(err) = copy_selected_entry(&state, &entry) {
-                    set_footer(&state, &format!("Paste failed: {err:#}"));
-                    return;
-                }
-                crate::window::close_overlay_and_paste(&state, &window);
+            if let Some(entry) = entry_at_row(&state, row)
+                && let Err(err) = queue_entry_copy(&state, entry.id, AfterCopy::Paste)
+            {
+                set_footer(&state, &format!("Paste failed: {err:#}"));
             }
         }
         AppView::Secrets => {
-            if let Some(secret) = secret_at_row(&state, row) {
-                if let Err(err) = copy_secret(&state, &secret) {
-                    set_footer(&state, &format!("Copy failed: {err:#}"));
-                    return;
-                }
-                crate::window::hide_overlay(&state, &window);
+            if let Some(secret) = secret_at_row(&state, row)
+                && let Err(err) = queue_secret_copy(&state, &secret, AfterCopy::Hide)
+            {
+                set_footer(&state, &format!("Copy failed: {err:#}"));
             }
         }
     });
@@ -473,7 +539,7 @@ fn connect_keyboard(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
                     gtk::glib::Propagation::Stop
                 }
                 (gdk::Key::Return | gdk::Key::KP_Enter, false) => {
-                    handle_enter(&state, &window);
+                    handle_enter(&state);
                     gtk::glib::Propagation::Stop
                 }
                 (gdk::Key::Return | gdk::Key::KP_Enter, true) => {
@@ -486,12 +552,11 @@ fn connect_keyboard(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
                             save_current_as_secret_dialog(&state, window.upcast_ref())
                         }
                         AppView::Secrets => {
-                            if let Some(secret) = current_secret(&state) {
-                                if let Err(err) = copy_secret(&state, &secret) {
-                                    set_footer(&state, &format!("Copy failed: {err:#}"));
-                                } else {
-                                    set_footer(&state, "Copied secret");
-                                }
+                            if let Some(secret) = current_secret(&state)
+                                && let Err(err) =
+                                    queue_secret_copy(&state, &secret, AfterCopy::REPORT_SECRET)
+                            {
+                                set_footer(&state, &format!("Copy failed: {err:#}"));
                             }
                         }
                     }
@@ -556,24 +621,20 @@ fn set_filter(state: &Rc<AppState>, filter: EntryFilter) {
     }
 }
 
-fn handle_enter(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
+fn handle_enter(state: &Rc<AppState>) {
     match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = current_full_entry(state) {
-                if let Err(err) = copy_selected_entry(state, &entry) {
-                    set_footer(state, &format!("Paste failed: {err:#}"));
-                } else {
-                    crate::window::close_overlay_and_paste(state, window);
-                }
+            if let Some(entry) = current_entry(state)
+                && let Err(err) = queue_entry_copy(state, entry.id, AfterCopy::Paste)
+            {
+                set_footer(state, &format!("Paste failed: {err:#}"));
             }
         }
         AppView::Secrets => {
-            if let Some(secret) = current_secret(state) {
-                if let Err(err) = copy_secret(state, &secret) {
-                    set_footer(state, &format!("Copy failed: {err:#}"));
-                } else {
-                    crate::window::hide_overlay(state, window);
-                }
+            if let Some(secret) = current_secret(state)
+                && let Err(err) = queue_secret_copy(state, &secret, AfterCopy::Hide)
+            {
+                set_footer(state, &format!("Copy failed: {err:#}"));
             }
         }
     }
@@ -582,21 +643,17 @@ fn handle_enter(state: &Rc<AppState>, window: &gtk::ApplicationWindow) {
 fn handle_copy(state: &Rc<AppState>) {
     match *state.view.borrow() {
         AppView::Clipboard => {
-            if let Some(entry) = current_full_entry(state) {
-                if let Err(err) = copy_selected_entry(state, &entry) {
-                    set_footer(state, &format!("Copy failed: {err:#}"));
-                } else {
-                    set_footer(state, "Copied selected entry");
-                }
+            if let Some(entry) = current_entry(state)
+                && let Err(err) = queue_entry_copy(state, entry.id, AfterCopy::REPORT_ENTRY)
+            {
+                set_footer(state, &format!("Copy failed: {err:#}"));
             }
         }
         AppView::Secrets => {
-            if let Some(secret) = current_secret(state) {
-                if let Err(err) = copy_secret(state, &secret) {
-                    set_footer(state, &format!("Copy failed: {err:#}"));
-                } else {
-                    set_footer(state, "Copied secret");
-                }
+            if let Some(secret) = current_secret(state)
+                && let Err(err) = queue_secret_copy(state, &secret, AfterCopy::REPORT_SECRET)
+            {
+                set_footer(state, &format!("Copy failed: {err:#}"));
             }
         }
     }
@@ -609,7 +666,7 @@ mod tests {
     use rsclip_core::Database;
     use rsclip_core::models::{EntryFilter, NewEntry, SortMode};
 
-    use super::{SEARCH_DEBOUNCE, start_list_worker};
+    use super::{SEARCH_DEBOUNCE, start_workers};
     use crate::components::topbar::SEARCH_ENTRY_DELAY_MS;
     use crate::state::{AppView, ListRequest, ListResults, WorkerRequest, WriteOp};
 
@@ -643,7 +700,8 @@ mod tests {
         let id = db.upsert_entry(&entry).unwrap();
         drop(db);
 
-        let (request_tx, response_rx) = start_list_worker(path.clone()).unwrap();
+        let workers = start_workers(path.clone()).unwrap();
+        let (request_tx, response_rx) = (workers.list_request_tx, workers.response_rx);
         request_tx
             .send(WorkerRequest::Write(WriteOp::SetPinned {
                 id,

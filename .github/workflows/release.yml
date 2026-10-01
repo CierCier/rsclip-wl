@@ -57,8 +57,10 @@ jobs:
                 gtk4-layer-shell \
                 gtksourceview5 \
                 rust \
+                ttf-dejavu \
+                weston \
                 zstd
-              ./scripts/build-release-archive.sh "'"${VERSION}"'"
+              RSCLIP_REQUIRE_HEADLESS_UI=1 ./scripts/build-release-archive.sh "'"${VERSION}"'"
             '
 
       - name: Publish GitHub release assets

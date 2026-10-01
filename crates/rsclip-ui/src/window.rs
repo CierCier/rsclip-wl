@@ -11,7 +11,7 @@ use rsclip_core::{AppConfig, Database, RsclipPaths};
 use crate::actions::refresh::refresh_entries;
 use crate::actions::update_mode_controls;
 use crate::components::{footer, list, preview, topbar};
-use crate::state::{AppState, AppView};
+use crate::state::{AppState, AppView, advance_clipboard_serial};
 
 pub(crate) struct UiRuntime {
     pub(crate) state: Rc<AppState>,
@@ -52,6 +52,8 @@ impl UiRuntime {
         sync_topbar_from_state(&self.state);
         update_mode_controls(&self.state);
 
+        // A paste still waiting on its delay must not land in the overlay.
+        advance_clipboard_serial(&self.state);
         self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         self.window.set_visible(true);
         self.window.present();
@@ -88,8 +90,7 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
     paths.ensure()?;
     let config = AppConfig::load(&paths)?;
     let db = Database::open(&paths.db_path)?;
-    let (list_request_tx, list_response_rx) =
-        crate::events::start_list_worker(paths.db_path.clone())?;
+    let workers = crate::events::start_workers(paths.db_path.clone())?;
 
     crate::style::load_css(&config)?;
 
@@ -147,9 +148,12 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
 
     let state = Rc::new(AppState {
         db,
-        list_request_tx,
-        list_response_rx,
+        list_request_tx: workers.list_request_tx,
+        list_response_rx: workers.response_rx,
         list_generation: Cell::new(0),
+        copy_request_tx: workers.copy_request_tx,
+        clipboard_serial: Cell::new(0),
+        pending_copies: Cell::new(0),
         favicon_icon_dir: paths.favicon_icon_dir.clone(),
         history_limit: Cell::new(config.history.max_entries),
         auto_paste: Cell::new(config.paste.auto_paste),
@@ -204,6 +208,7 @@ pub(crate) fn build_ui(app: &gtk::Application) -> Result<UiRuntime> {
     crate::notify::install_change_listener(&state, &window, &paths.socket_path)?;
     let config_monitor = crate::config_reload::install_config_watcher(&state, &window, &paths)?;
     crate::events::connect(&state, &window);
+    crate::highlight::warm_languages_while_hidden(&window);
 
     // Warm the Wayland layer-shell surface and GPU context so first presentation is instant.
     WidgetExt::realize(&window);
@@ -248,6 +253,7 @@ pub(crate) fn hide_overlay(state: &Rc<AppState>, window: &gtk::ApplicationWindow
 
     window.set_keyboard_mode(KeyboardMode::None);
     window.set_visible(false);
+    advance_clipboard_serial(state);
     *state.prompt_active.borrow_mut() = false;
     if state.currently_previewed_secret_id.take().is_some() {
         state.channels.text_buffer.set_text("");
@@ -260,7 +266,16 @@ pub(crate) fn close_overlay_and_paste(state: &Rc<AppState>, window: &gtk::Applic
     if state.auto_paste.get() {
         let delay = std::time::Duration::from_millis(state.paste_delay_ms.get());
         let method = state.paste_method.borrow().clone();
+        let serial = state.clipboard_serial.get();
+        let state = Rc::downgrade(state);
         gtk::glib::timeout_add_local_once(delay, move || {
+            // Another copy, or reopening the overlay, cancels this paste.
+            if state
+                .upgrade()
+                .is_none_or(|state| state.clipboard_serial.get() != serial)
+            {
+                return;
+            }
             if let Err(err) = rsclip_core::paste::trigger_paste_with_method(&method) {
                 eprintln!("rsclip: Paste failed: {err:#}");
             }

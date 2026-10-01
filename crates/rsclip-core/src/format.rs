@@ -35,18 +35,33 @@ pub fn format_full_time(timestamp: i64) -> String {
 
 /// Formats a Unix timestamp into a short relative string (e.g. "now", "5 min", "2 hr", "3 day").
 pub fn relative_time(timestamp: i64) -> String {
+    match relative_age(timestamp) {
+        RelativeAge::Now => "now".to_string(),
+        RelativeAge::Minutes(minutes) => format!("{minutes} min"),
+        RelativeAge::Hours(hours) => format!("{hours} hr"),
+        RelativeAge::Days(days) => format!("{days} day"),
+    }
+}
+
+/// The age [`relative_time`] shows; equal ages render the same label.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RelativeAge {
+    Now,
+    Minutes(i64),
+    Hours(i64),
+    Days(i64),
+}
+
+pub fn relative_age(timestamp: i64) -> RelativeAge {
     let seconds = (Utc::now().timestamp() - timestamp).max(0);
     if seconds < 60 {
-        "now".to_string()
+        RelativeAge::Now
     } else if seconds < 3_600 {
-        let minutes = seconds / 60;
-        format!("{minutes} min")
+        RelativeAge::Minutes(seconds / 60)
     } else if seconds < 86_400 {
-        let hours = seconds / 3_600;
-        format!("{hours} hr")
+        RelativeAge::Hours(seconds / 3_600)
     } else {
-        let days = seconds / 86_400;
-        format!("{days} day")
+        RelativeAge::Days(seconds / 86_400)
     }
 }
 
@@ -63,7 +78,7 @@ pub fn masked_secret(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{human_bytes, human_size, masked_secret};
+    use super::{RelativeAge, human_bytes, human_size, masked_secret, relative_age, relative_time};
 
     #[test]
     fn formats_human_bytes() {
@@ -84,5 +99,14 @@ mod tests {
         assert_eq!(masked_secret(""), "********");
         assert_eq!(masked_secret("abc"), "********abc");
         assert_eq!(masked_secret("secret-token"), "********oken");
+    }
+
+    #[test]
+    fn relative_age_matches_the_label() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_age(now - 30), RelativeAge::Now);
+        assert_eq!(relative_age(now - 150), RelativeAge::Minutes(2));
+        assert_eq!(relative_time(now - 150), "2 min");
+        assert_eq!(relative_age(now - 2 * 86_400), RelativeAge::Days(2));
     }
 }

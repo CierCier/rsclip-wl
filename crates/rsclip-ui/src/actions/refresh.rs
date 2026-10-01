@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use gtk4::prelude::*;
-use rsclip_core::models::{ClipboardEntry, SecretEntry};
+use rsclip_core::models::{ClipboardEntry, EntryData, SecretEntry};
 
 use crate::actions::selection::schedule_preview_for_current_selection;
 use crate::actions::set_footer;
@@ -56,6 +56,33 @@ pub(crate) fn rerender_current_list(state: &Rc<AppState>) {
     match *state.view.borrow() {
         AppView::Clipboard => render_clipboard_window(state, Some(selected_index), true),
         AppView::Secrets => render_secrets_window(state, Some(selected_index), true),
+    }
+}
+
+/// Refresh the favicons of rendered link rows; no other row shows one.
+///
+/// Favicon fetches land while the overlay is open, and rebuilding the whole
+/// ~120-row window per fetch cost ~35 ms of GTK time. Swapping only the link
+/// rows' content keeps every row, its selection, and the scroll position.
+pub(crate) fn rerender_link_rows(state: &Rc<AppState>) {
+    if *state.view.borrow() != AppView::Clipboard {
+        return;
+    }
+    let entries = state.entries.borrow();
+    let start = state.entries_start.get();
+    for (index, entry) in entries.iter().enumerate() {
+        if !matches!(entry.data, EntryData::Link { .. }) {
+            continue;
+        }
+        let Some(row) = row_index_for_entry(state, start + index)
+            .and_then(|row_index| state.list.row_at_index(row_index))
+        else {
+            continue;
+        };
+        let fresh = entry_row(entry, &state.favicon_icon_dir);
+        let content = fresh.child();
+        fresh.set_child(None::<&gtk4::Widget>);
+        row.set_child(content.as_ref());
     }
 }
 
@@ -438,6 +465,16 @@ fn plan_row_shift(old: &[RowKey], new: &[RowKey]) -> Option<RowShift> {
     })
 }
 
+/// For each key in `new`, the index of the `old` row showing the same key.
+fn plan_row_reuse(old: &[RowKey], new: &[RowKey]) -> Vec<Option<usize>> {
+    let mut old_index: std::collections::HashMap<RowKey, usize> = old
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (*key, index))
+        .collect();
+    new.iter().map(|key| old_index.remove(key)).collect()
+}
+
 /// Show the rows for `keys` (window `start` of `total`) between virtual spacers.
 ///
 /// A window shift used to destroy and rebuild all ~120 rows on the GTK
@@ -481,9 +518,26 @@ fn render_rows(
             }
         }
         None => {
+            // A new query rarely lines up with the old window, but typing
+            // "ht" -> "htt" keeps most rows: reuse any row whose key is still
+            // listed and build only the new ones.
+            let mut old_rows = Vec::with_capacity(old.len());
+            if list_len(list) == old.len() {
+                let mut child = list.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    old_rows.push(widget.downcast::<gtk4::ListBoxRow>().ok());
+                }
+            }
+            // Clear the selection first: a detached row keeps its selected
+            // state flag and would render as selected when re-added.
+            list.unselect_all();
             crate::components::clear_list(list);
-            for index in 0..keys.len() {
-                list.append(&make_row(index));
+            for (index, reuse) in plan_row_reuse(&old, &keys).into_iter().enumerate() {
+                let row = reuse
+                    .and_then(|old_index| old_rows.get_mut(old_index)?.take())
+                    .unwrap_or_else(|| make_row(index));
+                list.append(&row);
             }
         }
     }
@@ -706,7 +760,8 @@ fn update_secret_footer(state: &Rc<AppState>) {
 mod tests {
     use super::{
         RowShift, WINDOW_PADDING_ROWS, clamp_window_index, fetch_window, normalized_window_start,
-        plan_row_shift, resolve_window_selection, scroll_reload_start, window_row_count_for,
+        plan_row_reuse, plan_row_shift, resolve_window_selection, scroll_reload_start,
+        window_row_count_for,
     };
     use crate::state::RowKey;
 
@@ -758,6 +813,20 @@ mod tests {
         let shift = plan_row_shift(&old, &new).unwrap();
         assert_eq!((shift.add_front, shift.drop_back), (1, 1));
         assert_eq!(apply(&old, &new, shift), new);
+    }
+
+    #[test]
+    fn rebuild_reuses_rows_still_listed_by_a_new_query() {
+        // "ht" -> "htt": some results drop out, the rest reorder, one is new.
+        let old = keys([10, 11, 12, 13]);
+        let new = keys([12, 10, 99]);
+        assert_eq!(plan_row_reuse(&old, &new), vec![Some(2), Some(0), None]);
+        // A key is reused at most once.
+        assert_eq!(
+            plan_row_reuse(&keys([1]), &keys([1, 1])),
+            vec![Some(0), None]
+        );
+        assert_eq!(plan_row_reuse(&[], &keys([1])), vec![None]);
     }
 
     #[test]

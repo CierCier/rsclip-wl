@@ -84,6 +84,8 @@ thread_local! {
     static LANGUAGE_CACHE: RefCell<Option<HashMap<CodeLanguage, Language>>> =
         const { RefCell::new(None) };
     static SCHEME_CACHE: RefCell<Option<Option<StyleScheme>>> = const { RefCell::new(None) };
+    static LANGUAGE_KEEPALIVE: RefCell<HashMap<CodeLanguage, Buffer>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Cached sourceview language for `lang`, resolving on first use.
@@ -100,6 +102,54 @@ pub(crate) fn cached_language_for(lang: CodeLanguage) -> Option<Language> {
         }
         language
     })
+}
+
+/// Keep `lang`'s compiled highlighting contexts alive for the process.
+///
+/// A sourceview buffer compiles its language's context definitions (regexes
+/// for every context; Markdown ~65 ms) when it switches to that language, and
+/// frees them when the last buffer using the language switches away. The
+/// single preview buffer switching between languages recompiled them on every
+/// selection change. A one-line buffer per used language holds a reference,
+/// so each language compiles once.
+pub(crate) fn retain_language_contexts(lang: CodeLanguage, language: &Language) {
+    LANGUAGE_KEEPALIVE.with(|keepalive| {
+        let mut keepalive = keepalive.borrow_mut();
+        if keepalive.contains_key(&lang) {
+            return;
+        }
+        let buffer = Buffer::new(None);
+        buffer.set_language(Some(language));
+        buffer.set_highlight_syntax(true);
+        buffer.set_text("x\n");
+        buffer.ensure_highlight(&buffer.start_iter(), &buffer.end_iter());
+        keepalive.insert(lang, buffer);
+    });
+}
+
+/// Compile every language's highlighting contexts ahead of first use, one
+/// language per tick and only while the overlay is hidden, so the work never
+/// competes with a visible window (one language takes 10-70 ms).
+pub(crate) fn warm_languages_while_hidden(window: &gtk4::ApplicationWindow) {
+    use gtk4::prelude::*;
+
+    let window = window.downgrade();
+    let mut pending = CodeLanguage::ALL.into_iter();
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let Some(window) = window.upgrade() else {
+            return gtk4::glib::ControlFlow::Break;
+        };
+        if window.is_visible() {
+            return gtk4::glib::ControlFlow::Continue;
+        }
+        let Some(lang) = pending.next() else {
+            return gtk4::glib::ControlFlow::Break;
+        };
+        if let Some(language) = cached_language_for(lang) {
+            retain_language_contexts(lang, &language);
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
 }
 
 fn cached_scheme() -> Option<StyleScheme> {
@@ -172,31 +222,7 @@ mod tests {
         // Every CodeLanguage maps to a GtkSourceView language.
         {
             let lm = LanguageManager::default();
-            let languages = [
-                CodeLanguage::Rust,
-                CodeLanguage::Python,
-                CodeLanguage::JavaScript,
-                CodeLanguage::TypeScript,
-                CodeLanguage::Go,
-                CodeLanguage::C,
-                CodeLanguage::Cpp,
-                CodeLanguage::CSharp,
-                CodeLanguage::Java,
-                CodeLanguage::Html,
-                CodeLanguage::Css,
-                CodeLanguage::Json,
-                CodeLanguage::Yaml,
-                CodeLanguage::Toml,
-                CodeLanguage::Sql,
-                CodeLanguage::Shell,
-                CodeLanguage::Markdown,
-                CodeLanguage::Php,
-                CodeLanguage::Ruby,
-                CodeLanguage::Lua,
-                CodeLanguage::Xml,
-                CodeLanguage::Diff,
-                CodeLanguage::Docker,
-            ];
+            let languages = CodeLanguage::ALL;
 
             for lang in languages {
                 let id = lang.sourceview_id();

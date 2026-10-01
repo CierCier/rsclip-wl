@@ -9,7 +9,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use rsclip_core::notify::{CHANGE_EVENT, FAVICON_EVENT};
 
-use crate::actions::refresh::{refresh_entries, refresh_entries_if_changed, rerender_current_list};
+use crate::actions::refresh::{refresh_entries, refresh_entries_if_changed, rerender_link_rows};
 use crate::actions::set_footer;
 use crate::state::AppState;
 
@@ -72,7 +72,7 @@ pub(crate) fn install_change_listener(
             if favicons_changed {
                 crate::components::list::clear_favicon_cache();
                 if window.is_visible() {
-                    rerender_current_list(&state);
+                    rerender_link_rows(&state);
                 }
             }
             gtk::glib::ControlFlow::Continue

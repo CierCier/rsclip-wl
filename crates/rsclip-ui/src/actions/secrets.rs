@@ -3,7 +3,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use gtk::prelude::*;
 use gtk4 as gtk;
-use rsclip_core::secrets::{default_secret_alias, secret_value_from_entry};
+use rsclip_core::secrets::{default_secret_alias, summary_may_hold_secret};
 
 use crate::actions::refresh::{
     current_selected_index, refresh_entries, refresh_entries_at_index,
@@ -12,17 +12,19 @@ use crate::actions::refresh::{
 use crate::actions::{set_footer, update_mode_controls};
 use crate::dialogs::secret_alias::prompt_secret_alias;
 use crate::events::queue_write;
-use crate::state::{AppState, AppView, WriteOp, current_entry, current_full_entry, current_secret};
+use crate::state::{AppState, AppView, WriteOp, current_entry, current_secret};
 
 pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::Window) {
-    let Some(entry) = current_full_entry(state) else {
+    // The summary's text is cut, so it only rules out kinds that can never
+    // hold a secret; the worker checks the full payload.
+    let Some(entry) = current_entry(state) else {
         set_footer(state, "No selected entry to save");
         return;
     };
-    let Some(value) = secret_value_from_entry(&entry) else {
+    if !summary_may_hold_secret(&entry) {
         set_footer(state, "Only text-like entries can be saved as secrets");
         return;
-    };
+    }
     let default_alias = default_secret_alias(&entry);
 
     prompt_secret_alias(
@@ -36,7 +38,6 @@ pub(crate) fn save_current_as_secret_dialog(state: &Rc<AppState>, parent: &gtk::
                 WriteOp::SaveSecret {
                     entry_id: entry.id,
                     alias,
-                    value: value.clone(),
                 },
             )?;
             *state.view.borrow_mut() = AppView::Secrets;

@@ -12,11 +12,22 @@ use sourceview5::prelude::*;
 
 use crate::components::details::{render_details, render_secret_details};
 use crate::components::labels::{muted_label, section_label};
-use crate::state::AppState;
+use crate::state::{AfterCopy, AppState, CopySource};
 
-/// UI-side safety net for previews. Capped at 64 KiB so large text entries
-/// layout smoothly in `TextView` without blocking the GTK main thread.
-pub(crate) const MAX_FULL_PREVIEW_BYTES: usize = 64 * 1024;
+/// Bytes of an entry that previews read. The first 64 KiB of every text entry
+/// sits in the `entry_text` side table, so reads within this bound stay cheap
+/// even for legacy multi-megabyte rows; larger summaries upgrade after the
+/// keypress instead of blocking it.
+pub(crate) const MAX_PREVIEW_READ_BYTES: usize = 64 * 1024;
+/// Bounds for text shown in the preview `TextView`, which lays out and paints
+/// on the GTK thread. Pango wraps a paragraph as one unit, so a single long
+/// line is the worst case: a 64 KiB base64 line took ~1.3 s to paint and a
+/// 64 KiB multi-line log ~40-70 ms. Past these bounds the preview truncates;
+/// copying always delivers the full text.
+pub(crate) const MAX_PREVIEW_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_PREVIEW_LINE_BYTES: usize = 1024;
+pub(crate) const MAX_PREVIEW_LINES: usize = 400;
+pub(crate) const PREVIEW_LINE_TRUNCATED_MARKER: &str = " …";
 /// Payloads larger than this render as plain monospace (no syntax coloring).
 /// gtksourceview's context parse costs roughly 1 ms per KiB, so a 64 KiB code
 /// row cost ~57 ms per keypress; content beyond the bound is still shown and
@@ -111,10 +122,8 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
     state.ocr_button.set_opacity(0.0);
     state.ocr_button.set_sensitive(false);
 
-    state
-        .channels
-        .text_buffer
-        .set_text(&masked_secret(&secret.value));
+    let masked = bounded_full_preview(&masked_secret(&secret.value)).into_owned();
+    state.channels.text_buffer.set_text(&masked);
     state.channels.text.vadjustment().set_value(0.0);
     state.preview.append(&state.channels.text);
 
@@ -125,10 +134,12 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
         let state = Rc::clone(state);
         let secret = secret.clone();
         copy_button.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_secret(&state, &secret) {
+            if let Err(err) = crate::actions::clipboard::queue_secret_copy(
+                &state,
+                &secret,
+                AfterCopy::REPORT_SECRET,
+            ) {
                 crate::actions::set_footer(&state, &format!("Copy failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied secret");
             }
         });
     }
@@ -137,8 +148,7 @@ pub(crate) fn render_secret_preview(state: &Rc<AppState>, secret: &SecretEntry) 
     let reveal_button = gtk::Button::with_label("Reveal");
     {
         let buffer = state.channels.text_buffer.clone();
-        let value = secret.value.clone();
-        let masked = masked_secret(&secret.value);
+        let value = bounded_full_preview(&secret.value).into_owned();
         reveal_button.connect_clicked(move |button| {
             if button.label().as_deref() == Some("Reveal") {
                 buffer.set_text(&value);
@@ -213,7 +223,7 @@ pub(crate) fn render_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     let (full, defer_full_read) = match &entry.data {
         EntryData::Text | EntryData::Unknown | EntryData::File { .. } => {
             let huge_summary =
-                entry.text_content.is_none() && entry.size_bytes > MAX_FULL_PREVIEW_BYTES as i64;
+                entry.text_content.is_none() && entry.size_bytes > MAX_PREVIEW_READ_BYTES as i64;
             if huge_summary {
                 (entry.clone(), true)
             } else {
@@ -275,12 +285,13 @@ pub(crate) fn clear_preview_state(state: &Rc<AppState>) {
     state.ocr_button.set_sensitive(false);
 }
 
-/// Render an image preview without decoding on the GTK thread.
+/// Render an image preview without touching the image file on the GTK thread.
 ///
-/// Decoding a 1920x1080 PNG takes tens of milliseconds; doing it inline on
-/// every selection made arrowing through screenshots stutter. The frame is
-/// sized from the file header immediately, the pixels decode on a GIO worker
-/// thread, and recently shown images come from a small cache.
+/// Decoding a 1920x1080 PNG takes tens of milliseconds, and even reading the
+/// header (`Pixbuf::file_info`) of a 4 MB screenshot cost ~50 ms cold, so
+/// arrowing through screenshots stuttered. The frame appears immediately, the
+/// header read and decode run on a GIO worker thread, and recently shown
+/// images come from a small cache.
 fn render_image_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     rsclip_core::profiler::begin_phase("render_image_preview");
     let EntryData::Image { file_path, .. } = &entry.data else {
@@ -297,14 +308,8 @@ fn render_image_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         return;
     }
 
-    let Some((_, width, height)) = gdk_pixbuf::Pixbuf::file_info(file_path) else {
-        state
-            .preview
-            .append(&muted_label("Image preview is unavailable"));
-        rsclip_core::profiler::end_phase("render_image_preview");
-        return;
-    };
-    let (frame, picture) = image_frame(width, height);
+    // Sized 16:9 until the worker reports the real dimensions.
+    let (frame, picture) = image_frame(16, 9);
     state.preview.append(&frame);
 
     let state = Rc::clone(state);
@@ -323,7 +328,10 @@ fn render_image_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
             return;
         }
         match texture {
-            Some(texture) => picture.set_paintable(Some(&texture)),
+            Some(texture) => {
+                frame.set_ratio(image_ratio(texture.width(), texture.height()));
+                picture.set_paintable(Some(&texture));
+            }
             None if frame.parent().is_some() => {
                 state
                     .preview
@@ -398,10 +406,13 @@ fn decode_image_preview(path: &str) -> Option<gdk::Texture> {
     Some(texture.upcast())
 }
 
+fn image_ratio(width: i32, height: i32) -> f32 {
+    (width as f32 / height.max(1) as f32).clamp(0.2, 8.0)
+}
+
 /// Aspect-correct frame for an image whose pixels may arrive later.
 fn image_frame(width: i32, height: i32) -> (gtk::AspectFrame, gtk::Picture) {
-    let ratio = (width as f32 / height.max(1) as f32).clamp(0.2, 8.0);
-    let frame = gtk::AspectFrame::new(0.5, 0.5, ratio, false);
+    let frame = gtk::AspectFrame::new(0.5, 0.5, image_ratio(width, height), false);
     frame.set_hexpand(true);
     frame.set_vexpand(true);
 
@@ -427,7 +438,7 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
     // payload: legacy rows can hold thousands of URIs and this runs on the
     // GTK thread.
     let bounded =
-        parse_uri_list_bounded(payload, URI_LIST_PREVIEW_MAX_FILES, MAX_FULL_PREVIEW_BYTES);
+        parse_uri_list_bounded(payload, URI_LIST_PREVIEW_MAX_FILES, MAX_PREVIEW_READ_BYTES);
     if bounded.files.is_empty() {
         render_text_preview_state(state, Some(payload));
         rsclip_core::profiler::end_phase("render_file_preview");
@@ -465,10 +476,13 @@ fn render_file_preview(state: &Rc<AppState>, entry: &ClipboardEntry) {
         let state = Rc::clone(state);
         let paths = paths.clone();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&paths) {
+            let then = AfterCopy::Report {
+                done: "Copied paths",
+                failed: "Copy paths failed",
+            };
+            let source = CopySource::Text(paths.clone());
+            if let Err(err) = crate::actions::clipboard::queue_copy(&state, source, then) {
                 crate::actions::set_footer(&state, &format!("Copy paths failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied paths");
             }
         });
     }
@@ -539,10 +553,13 @@ fn render_ocr_header(state: &Rc<AppState>, ocr: &str) {
         let state = Rc::clone(state);
         let ocr = ocr.to_string();
         copy.connect_clicked(move |_| {
-            if let Err(err) = crate::actions::clipboard::copy_text(&ocr) {
+            let then = AfterCopy::Report {
+                done: "Copied OCR text",
+                failed: "Copy OCR failed",
+            };
+            let source = CopySource::Text(ocr.clone());
+            if let Err(err) = crate::actions::clipboard::queue_copy(&state, source, then) {
                 crate::actions::set_footer(&state, &format!("Copy OCR failed: {err:#}"));
-            } else {
-                crate::actions::set_footer(&state, "Copied OCR text");
             }
         });
     }
@@ -567,13 +584,13 @@ fn full_entry_for_preview(state: &Rc<AppState>, entry: &ClipboardEntry) -> Clipb
 /// The summary row with its text replaced by the bounded preview body.
 ///
 /// Only the capped body is read (the preview truncates at
-/// MAX_FULL_PREVIEW_BYTES anyway); every other field already came with the
+/// MAX_PREVIEW_BYTES anyway); every other field already came with the
 /// summary, so a legacy multi-megabyte row never stalls the GTK thread.
 /// Copying still uses the full row via Database::get_entry.
 fn with_preview_text(state: &Rc<AppState>, entry: &ClipboardEntry) -> Option<ClipboardEntry> {
     let text = state
         .db
-        .get_text_preview(entry.id, MAX_FULL_PREVIEW_BYTES + 1)
+        .get_text_preview(entry.id, MAX_PREVIEW_BYTES + 1)
         .ok()
         .flatten()?;
     let mut full = entry.clone();
@@ -661,6 +678,7 @@ fn render_code_preview(state: &Rc<AppState>, text: &str, lang: rsclip_core::synt
     // language runs as one batch after the text is in place.
     buffer.set_highlight_syntax(false);
     if highlight && let Some(language) = crate::highlight::cached_language_for(lang) {
+        crate::highlight::retain_language_contexts(lang, &language);
         buffer.set_language(Some(&language));
     }
     buffer.set_text(&sanitized);
@@ -686,51 +704,184 @@ fn fill_text_preview(state: &Rc<AppState>, text: Option<&str>) {
     state.channels.text_buffer.set_text(&sanitized);
 }
 
-/// Cap preview text without splitting a UTF-8 code point, and detect binary payloads.
+/// Bound preview text so the `TextView` lays it out in a few milliseconds.
 ///
-/// Bounded to 64 KiB so large text entries layout smoothly in `TextView` without
-/// freezing the GTK main thread. Payloads containing interior null bytes are treated
-/// as binary and presented with an explanatory notice instead of crashing GTK FFI.
-fn bounded_full_preview(text: &str) -> std::borrow::Cow<'_, str> {
+/// Keeps at most [`MAX_PREVIEW_LINES`] lines and [`MAX_PREVIEW_BYTES`] bytes,
+/// cuts lines longer than [`MAX_PREVIEW_LINE_BYTES`] (marking the cut), and
+/// never splits a UTF-8 code point. Payloads containing interior null bytes
+/// are treated as binary and replaced with an explanatory notice instead of
+/// crashing GTK FFI.
+pub(crate) fn bounded_full_preview(text: &str) -> std::borrow::Cow<'_, str> {
     if is_binary_payload(text) {
         return std::borrow::Cow::Borrowed(BINARY_PREVIEW_NOTICE);
     }
 
-    if text.len() <= MAX_FULL_PREVIEW_BYTES {
+    let within_bounds = text.len() <= MAX_PREVIEW_BYTES
+        && text
+            .split('\n')
+            .enumerate()
+            .all(|(index, line)| index < MAX_PREVIEW_LINES && line.len() <= MAX_PREVIEW_LINE_BYTES);
+    if within_bounds {
         return std::borrow::Cow::Borrowed(text);
     }
 
-    let mut end = MAX_FULL_PREVIEW_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let mut preview = String::with_capacity(
+        MAX_PREVIEW_BYTES.min(text.len()) + FULL_PREVIEW_TRUNCATED_NOTICE.len(),
+    );
+    let mut truncated = false;
+    for (index, line) in text.split('\n').enumerate() {
+        // Stop before the separator once the budget is spent: empty lines
+        // would otherwise keep adding one byte each past it.
+        if index == MAX_PREVIEW_LINES || (index > 0 && preview.len() >= MAX_PREVIEW_BYTES) {
+            truncated = true;
+            break;
+        }
+        if index > 0 {
+            preview.push('\n');
+        }
+        let budget = MAX_PREVIEW_BYTES.saturating_sub(preview.len());
+        let limit = MAX_PREVIEW_LINE_BYTES.min(budget);
+        if line.len() <= limit {
+            preview.push_str(line);
+            continue;
+        }
+        preview.push_str(&line[..floor_char_boundary(line, limit)]);
+        truncated = true;
+        if limit == budget {
+            break;
+        }
+        preview.push_str(PREVIEW_LINE_TRUNCATED_MARKER);
     }
-    let mut preview = String::with_capacity(end + FULL_PREVIEW_TRUNCATED_NOTICE.len());
-    preview.push_str(&text[..end]);
-    preview.push_str(FULL_PREVIEW_TRUNCATED_NOTICE);
+    if truncated {
+        preview.push_str(FULL_PREVIEW_TRUNCATED_NOTICE);
+    }
     std::borrow::Cow::Owned(preview)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BINARY_PREVIEW_NOTICE, FULL_PREVIEW_TRUNCATED_NOTICE, MAX_FULL_PREVIEW_BYTES,
+        BINARY_PREVIEW_NOTICE, FULL_PREVIEW_TRUNCATED_NOTICE, MAX_PREVIEW_BYTES,
+        MAX_PREVIEW_LINE_BYTES, MAX_PREVIEW_LINES, PREVIEW_LINE_TRUNCATED_MARKER,
         bounded_full_preview,
     };
 
+    /// Shapes that once froze the GTK thread when previewed unbounded.
+    fn pathological_payloads() -> Vec<(&'static str, String)> {
+        vec![
+            ("64 KiB single-line base64", "QUJD".repeat(16 * 1024)),
+            ("1 MiB single line", "x".repeat(1024 * 1024)),
+            ("multi-byte single line", "🦀".repeat(MAX_PREVIEW_BYTES)),
+            (
+                "64 KiB JSON",
+                "{\"key\": \"value\", \"n\": 12345},\n".repeat(2_000),
+            ),
+            ("100k empty lines", "\n".repeat(100_000)),
+            (
+                "exactly full budget, then empty lines",
+                format!("{}\n", "z".repeat(MAX_PREVIEW_LINE_BYTES - 1)).repeat(15)
+                    + &"z".repeat(MAX_PREVIEW_LINE_BYTES)
+                    + &"\n".repeat(300),
+            ),
+            (
+                "long lines between short ones",
+                format!("head\n{}\ntail\n", "y".repeat(10_000)).repeat(20),
+            ),
+            (
+                "CRLF log",
+                "2026-09-30 INFO request served\r\n".repeat(5_000),
+            ),
+        ]
+    }
+
+    /// Every preview must stay within the layout bounds, whatever the payload.
+    #[test]
+    fn perf_preview_text_stays_within_layout_bounds() {
+        let max_body = MAX_PREVIEW_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len();
+        let max_line = MAX_PREVIEW_LINE_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len();
+        for (name, payload) in pathological_payloads() {
+            let preview = bounded_full_preview(&payload);
+            let body = preview
+                .strip_suffix(FULL_PREVIEW_TRUNCATED_NOTICE)
+                .unwrap_or(&preview);
+            assert!(
+                body.len() <= max_body,
+                "{name}: preview body is {} bytes",
+                body.len()
+            );
+            assert!(
+                body.split('\n').count() <= MAX_PREVIEW_LINES,
+                "{name}: preview keeps {} lines",
+                body.split('\n').count()
+            );
+            let longest = body.split('\n').map(str::len).max().unwrap_or(0);
+            assert!(
+                longest <= max_line,
+                "{name}: preview line is {longest} bytes"
+            );
+            assert!(
+                preview.ends_with(FULL_PREVIEW_TRUNCATED_NOTICE),
+                "{name}: truncation must be announced"
+            );
+        }
+    }
+
+    /// Measured on the preview `TextView`: one wrapped 8 KiB line paints in
+    /// ~18 ms, 64 KiB in ~1.3 s, so the bounds must stay near these values.
+    /// The headless UI test (tests/headless_ui_perf.rs) times the real paint.
+    #[test]
+    fn perf_preview_bounds_stay_small() {
+        const { assert!(MAX_PREVIEW_LINE_BYTES <= 2 * 1024) };
+        const { assert!(MAX_PREVIEW_BYTES <= 32 * 1024) };
+        const { assert!(MAX_PREVIEW_LINES <= 1_000) };
+    }
+
     #[test]
     fn preview_is_bounded_on_utf8_boundary() {
-        let text = "🦀".repeat(MAX_FULL_PREVIEW_BYTES);
+        let text = "🦀".repeat(MAX_PREVIEW_BYTES);
         let preview = bounded_full_preview(&text);
 
         assert!(preview.ends_with(FULL_PREVIEW_TRUNCATED_NOTICE));
-        assert!(preview.len() <= MAX_FULL_PREVIEW_BYTES + FULL_PREVIEW_TRUNCATED_NOTICE.len());
         assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
     }
 
     #[test]
-    fn small_preview_is_unchanged() {
-        let text = "small clipboard entry";
-        assert_eq!(bounded_full_preview(text), text);
+    fn long_line_is_cut_and_marked_but_following_lines_survive() {
+        let text = format!("{}\nsecond line", "a".repeat(MAX_PREVIEW_LINE_BYTES * 3));
+        let preview = bounded_full_preview(&text);
+
+        let mut lines = preview.split('\n');
+        let first = lines.next().unwrap();
+        assert!(first.ends_with(PREVIEW_LINE_TRUNCATED_MARKER));
+        assert_eq!(
+            first.len(),
+            MAX_PREVIEW_LINE_BYTES + PREVIEW_LINE_TRUNCATED_MARKER.len()
+        );
+        assert_eq!(
+            lines.next().map(|line| line.starts_with("second line")),
+            Some(true)
+        );
+        assert!(preview.ends_with(FULL_PREVIEW_TRUNCATED_NOTICE));
+    }
+
+    #[test]
+    fn preview_within_bounds_is_borrowed_unchanged() {
+        for text in [
+            "small clipboard entry",
+            "line one\r\nline two\n",
+            &"z".repeat(MAX_PREVIEW_LINE_BYTES),
+        ] {
+            let preview = bounded_full_preview(text);
+            assert!(matches!(preview, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(preview, text);
+        }
     }
 
     #[test]
