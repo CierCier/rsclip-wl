@@ -375,9 +375,9 @@ impl AppConfig {
         }
     }
 
-    /// All TOML files that contribute to the loaded config: the main
-    /// `config.toml` plus every transitively included file that exists.
-    /// Used by the resident UI to hot-reload theme files as well.
+    /// All paths that contribute to or are referenced by the loaded config,
+    /// including missing or invalid included files. Used by the resident UI
+    /// to watch and hot-reload theme files.
     pub fn dependencies(paths: &RsclipPaths) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = Vec::new();
@@ -400,7 +400,10 @@ fn load_merged_value(
     stack: &mut Vec<PathBuf>,
 ) -> Result<Option<toml::Value>> {
     if depth > MAX_INCLUDE_DEPTH {
-        bail!("include depth exceeds {MAX_INCLUDE_DEPTH}: {}", path.display());
+        bail!(
+            "include depth exceeds {MAX_INCLUDE_DEPTH}: {}",
+            path.display()
+        );
     }
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -469,9 +472,7 @@ fn extract_includes(value: &mut toml::Value, including_path: &Path) -> Result<Ve
         ),
     };
 
-    let base_dir = including_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let base_dir = including_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(entries
         .into_iter()
         .map(|entry| {
@@ -505,8 +506,8 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
-/// Depth-first collection of existing config files for hot-reload.
-/// Missing files are skipped here; `load_merged_value` still errors on them.
+/// Depth-first collection of config dependencies, including missing targets.
+/// Invalid included files remain dependencies so fixing them triggers reload.
 fn collect_dependencies(
     path: &Path,
     depth: usize,
@@ -516,16 +517,17 @@ fn collect_dependencies(
     if depth > MAX_INCLUDE_DEPTH {
         return;
     }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canonical) {
+        return;
+    }
+    if !out.contains(&canonical) {
+        out.push(canonical.clone());
+    }
     let Ok(contents) = fs::read_to_string(path) else {
         return;
     };
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if stack.contains(&canonical) || out.contains(&canonical) {
-        return;
-    }
-    stack.push(canonical.clone());
-    out.push(canonical);
-
+    stack.push(canonical);
     let mut value: toml::Value = if contents.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
@@ -880,6 +882,64 @@ accent = "#00ff00"
         let deps = AppConfig::dependencies(&paths);
         assert_eq!(deps.len(), 3);
     }
+    #[test]
+    fn dependencies_include_missing_and_invalid_targets() {
+        let paths = test_paths("include-missing-dependencies");
+        fs::create_dir_all(&paths.config_dir).expect("test config dir should be created");
+        let missing = paths.config_dir.join("theme.conf");
+        fs::write(paths.config_path(), "include = \"theme.conf\"\n")
+            .expect("main config should be written");
+        fs::write(&missing, "not valid = TOML =").expect("invalid include should be written");
+
+        let dependencies = AppConfig::dependencies(&paths);
+
+        assert!(dependencies.contains(&paths.config_path()));
+        assert!(dependencies.contains(&missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependencies_traverse_each_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let paths = test_paths("include-alias-dependencies");
+        fs::create_dir_all(paths.config_dir.join("sub")).expect("subdirectory should be created");
+        fs::write(
+            paths.config_dir.join("shared.toml"),
+            "include = \"base.conf\"\n",
+        )
+        .expect("shared include should be written");
+        fs::write(
+            paths.config_dir.join("sub").join("base.conf"),
+            "[ui]\ntheme = \"sub\"\n",
+        )
+        .expect("nested base should be written");
+        fs::write(
+            paths.config_dir.join("base.conf"),
+            "[ui]\ntheme = \"root\"\n",
+        )
+        .expect("root base should be written");
+        symlink(
+            paths.config_dir.join("shared.toml"),
+            paths.config_dir.join("sub").join("alias.toml"),
+        )
+        .expect("nested alias should be created");
+        symlink(
+            paths.config_dir.join("shared.toml"),
+            paths.config_dir.join("alias.toml"),
+        )
+        .expect("root alias should be created");
+        fs::write(
+            paths.config_path(),
+            "include = [\"sub/alias.toml\", \"alias.toml\"]\n",
+        )
+        .expect("main config should be written");
+
+        let dependencies = AppConfig::dependencies(&paths);
+
+        assert!(dependencies.contains(&paths.config_dir.join("base.conf")));
+        assert!(dependencies.contains(&paths.config_dir.join("sub").join("base.conf")));
+    }
 
     #[test]
     fn include_missing_file_returns_error() {
@@ -899,8 +959,11 @@ accent = "#00ff00"
         fs::create_dir_all(&paths.config_dir).expect("test config dir should be created");
         fs::write(paths.config_path(), "include = \"b.toml\"\n")
             .expect("main config file should be written");
-        fs::write(paths.config_dir.join("b.toml"), "include = \"config.toml\"\n")
-            .expect("b.toml should be written");
+        fs::write(
+            paths.config_dir.join("b.toml"),
+            "include = \"config.toml\"\n",
+        )
+        .expect("b.toml should be written");
 
         let err = AppConfig::load(&paths).unwrap_err();
 
