@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -28,12 +28,21 @@ pub(crate) fn install_config_watcher(
 
     let pending_reload = Rc::new(RefCell::new(None::<gtk::glib::SourceId>));
     let config_path = paths.config_path();
+    let config_dir_path = paths.config_dir.clone();
+    let known_deps = Rc::new(RefCell::new(AppConfig::dependencies(paths)));
     let paths = paths.clone();
     let state = Rc::clone(state);
     let window = window.clone();
 
     monitor.connect_changed(move |_, file, other_file, event| {
-        if !should_reload_config(file, other_file, event, &config_path) {
+        if !should_reload_config(
+            file,
+            other_file,
+            event,
+            &config_path,
+            &config_dir_path,
+            &known_deps.borrow(),
+        ) {
             return;
         }
 
@@ -44,6 +53,7 @@ pub(crate) fn install_config_watcher(
         let state = Rc::clone(&state);
         let window = window.clone();
         let paths = paths.clone();
+        let known_deps = Rc::clone(&known_deps);
         let pending_reload_for_timeout = Rc::clone(&pending_reload);
         let source_id = gtk::glib::timeout_add_local_once(CONFIG_RELOAD_DEBOUNCE, move || {
             let _ = pending_reload_for_timeout.borrow_mut().take();
@@ -51,6 +61,8 @@ pub(crate) fn install_config_watcher(
                 let message = format!("Config reload failed: {err:#}");
                 set_footer(&state, &message);
                 tracing::warn!("{message}");
+            } else {
+                *known_deps.borrow_mut() = AppConfig::dependencies(&paths);
             }
         });
         *pending_reload.borrow_mut() = Some(source_id);
@@ -167,6 +179,8 @@ fn should_reload_config(
     other_file: Option<&gio::File>,
     event: gio::FileMonitorEvent,
     config_path: &Path,
+    config_dir: &Path,
+    dependencies: &[PathBuf],
 ) -> bool {
     let reload_event = matches!(
         event,
@@ -180,11 +194,39 @@ fn should_reload_config(
             | gio::FileMonitorEvent::MovedOut
     );
     reload_event
-        && (file_matches(file, config_path)
-            || other_file.is_some_and(|file| file_matches(file, config_path)))
+        && (file_matches(file, config_path, config_dir, dependencies)
+            || other_file.is_some_and(|file| {
+                file_matches(file, config_path, config_dir, dependencies)
+            }))
 }
 
-fn file_matches(file: &gio::File, config_path: &Path) -> bool {
-    file.path()
-        .is_some_and(|path| path.as_path() == config_path)
+fn file_matches(
+    file: &gio::File,
+    config_path: &Path,
+    config_dir: &Path,
+    dependencies: &[PathBuf],
+) -> bool {
+    let Some(path) = file.path() else {
+        return false;
+    };
+    let path = path.as_path();
+    if path == config_path {
+        return true;
+    }
+    // Known `include` targets (canonicalized at load time), including absolute
+    // paths outside the config dir.
+    if dependencies.iter().any(|dep| dep.as_path() == path) {
+        return true;
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        if dependencies
+            .iter()
+            .any(|dep| dep.as_path() == canonical)
+        {
+            return true;
+        }
+    }
+    // Fallback for newly added theme files not yet in the dependency list:
+    // any TOML file under the config dir triggers a reload attempt.
+    path.extension().is_some_and(|ext| ext == "toml") && path.starts_with(config_dir)
 }
